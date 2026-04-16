@@ -195,8 +195,45 @@ pub(crate) struct ImplicitFeedback {
     pub revision_message_count: u64,
     pub correction_message_count: u64,
     pub fast_denial_count: u64,
+    #[serde(default)]
+    pub rapid_revert_count: u64,
+    #[serde(default)]
+    pub session_abandon_count: u64,
     pub fallback_histogram: HashMap<String, u64>,
     pub top_tool_fallbacks: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BehaviorAdaptationProfile {
+    pub mode: SatisfactionAdaptationMode,
+    pub prompt_for_clarification: bool,
+    pub compact_response: bool,
+    pub preferred_tool_fallbacks: Vec<String>,
+}
+
+impl BehaviorAdaptationProfile {
+    pub(crate) fn from_model(model: &OperatorModel) -> Self {
+        let mode = SatisfactionAdaptationMode::from_label(&model.operator_satisfaction.label);
+        let prompt_for_clarification = matches!(mode, SatisfactionAdaptationMode::Minimal)
+            && (model.implicit_feedback.rapid_revert_count > 0
+                || model.implicit_feedback.session_abandon_count > 0
+                || model.implicit_feedback.correction_message_count > 0)
+            || matches!(mode, SatisfactionAdaptationMode::Tightened)
+                && (model.implicit_feedback.correction_message_count > 0
+                    || model.implicit_feedback.fast_denial_count > 0);
+        let compact_response = !matches!(mode, SatisfactionAdaptationMode::Normal)
+            || model.implicit_feedback.correction_message_count > 0
+            || model.implicit_feedback.fast_denial_count > 0;
+        Self {
+            mode,
+            prompt_for_clarification,
+            compact_response,
+            preferred_tool_fallbacks: preferred_tool_fallback_targets(
+                &model.implicit_feedback.top_tool_fallbacks,
+                3,
+            ),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -344,11 +381,13 @@ impl OperatorModel {
             || self.implicit_feedback.tool_hesitation_count > 0
             || self.implicit_feedback.revision_message_count > 0
             || self.implicit_feedback.correction_message_count > 0
-            || self.implicit_feedback.fast_denial_count > 0;
+            || self.implicit_feedback.fast_denial_count > 0
+            || self.implicit_feedback.rapid_revert_count > 0
+            || self.implicit_feedback.session_abandon_count > 0;
 
         let signal_state = if signal_present { "present" } else { "missing" };
         format!(
-            "satisfaction={} ({:.2}) [strained <0.35, fragile <0.55, healthy <0.80, strong >=0.80]; signal {}; friction revisions {}, corrections {}, tool fallbacks {}, fast denials {}, rapid switches {}",
+            "satisfaction={} ({:.2}) [strained <0.35, fragile <0.55, healthy <0.80, strong >=0.80]; signal {}; friction revisions {}, corrections {}, tool fallbacks {}, fast denials {}, rapid reverts {}, session abandons {}, rapid switches {}",
             self.operator_satisfaction.label,
             self.operator_satisfaction.score,
             signal_state,
@@ -356,6 +395,8 @@ impl OperatorModel {
             self.implicit_feedback.correction_message_count,
             self.implicit_feedback.tool_hesitation_count,
             self.implicit_feedback.fast_denial_count,
+            self.implicit_feedback.rapid_revert_count,
+            self.implicit_feedback.session_abandon_count,
             self.attention_topology.rapid_switch_count,
         )
     }

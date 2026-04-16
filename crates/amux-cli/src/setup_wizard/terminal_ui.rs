@@ -1,5 +1,11 @@
 use super::*;
 
+pub(super) fn is_submit_key(code: KeyCode, modifiers: KeyModifiers) -> bool {
+    matches!(code, KeyCode::Enter | KeyCode::Char('\r') | KeyCode::Char('\n'))
+        || (code == KeyCode::Char('m') && modifiers.contains(KeyModifiers::CONTROL))
+        || (code == KeyCode::Char('j') && modifiers.contains(KeyModifiers::CONTROL))
+}
+
 pub(super) fn select_list(
     title: &str,
     items: &[(&str, &str)],
@@ -10,9 +16,9 @@ pub(super) fn select_list(
 
     let mut stdout = io::stdout();
     let mut selected: usize = default_index.min(items.len().saturating_sub(1));
-    terminal::enable_raw_mode().context("Failed to enable raw mode")?;
+    let _raw_mode = RawModeGuard::new()?;
 
-    let result = (|| -> Result<Option<usize>> {
+    (|| -> Result<Option<usize>> {
         loop {
             queue!(
                 stdout,
@@ -74,7 +80,7 @@ pub(super) fn select_list(
                             selected = 0;
                         }
                     }
-                    KeyCode::Enter => {
+                    _ if is_submit_key(code, modifiers) => {
                         execute!(stdout, style::SetForegroundColor(style::Color::Reset),)?;
                         return Ok(Some(selected));
                     }
@@ -96,10 +102,7 @@ pub(super) fn select_list(
                 terminal::Clear(terminal::ClearType::FromCursorDown),
             )?;
         }
-    })();
-
-    terminal::disable_raw_mode().context("Failed to disable raw mode")?;
-    result
+    })()
 }
 
 pub(super) fn text_input(prompt_text: &str, default: &str, masked: bool) -> Result<Option<String>> {
@@ -112,9 +115,9 @@ pub(super) fn text_input(prompt_text: &str, default: &str, masked: bool) -> Resu
         execute!(stdout, style::Print(format!("{prompt_text}: ")))?;
     }
 
-    terminal::enable_raw_mode().context("Failed to enable raw mode for input")?;
+    let _raw_mode = RawModeGuard::new()?;
 
-    let result = (|| -> Result<Option<String>> {
+    (|| -> Result<Option<String>> {
         let mut input = String::new();
         loop {
             if let Event::Key(KeyEvent {
@@ -122,7 +125,7 @@ pub(super) fn text_input(prompt_text: &str, default: &str, masked: bool) -> Resu
             }) = event::read()?
             {
                 match code {
-                    KeyCode::Enter => {
+                    _ if is_submit_key(code, modifiers) => {
                         execute!(stdout, style::Print("\r\n"))?;
                         let value = if input.is_empty() && !default.is_empty() {
                             default.to_string()
@@ -155,8 +158,5 @@ pub(super) fn text_input(prompt_text: &str, default: &str, masked: bool) -> Resu
                 }
             }
         }
-    })();
-
-    terminal::disable_raw_mode().context("Failed to disable raw mode")?;
-    result
+    })()
 }

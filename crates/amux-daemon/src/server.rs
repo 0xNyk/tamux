@@ -3,6 +3,7 @@
 use std::collections::HashSet;
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use amux_protocol::{
     ClientMessage, DaemonMessage, GatewayBootstrapPayload, GatewayConnectionStatus,
@@ -14,7 +15,7 @@ use anyhow::{Context, Result};
 use futures::SinkExt;
 use futures::StreamExt;
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::sync::{broadcast, mpsc, watch};
+use tokio::sync::{broadcast, mpsc};
 use tokio_util::codec::Framed;
 
 use crate::agent::skill_community::{
@@ -43,33 +44,34 @@ include!("server/post_tests.rs");
 
 #[derive(Clone)]
 struct StartupReadiness {
-    tx: watch::Sender<bool>,
+    ready: Arc<AtomicBool>,
+    notify: Arc<tokio::sync::Notify>,
 }
 
 impl StartupReadiness {
     fn new(initial_ready: bool) -> Self {
-        let (tx, _rx) = watch::channel(initial_ready);
-        Self { tx }
+        Self {
+            ready: Arc::new(AtomicBool::new(initial_ready)),
+            notify: Arc::new(tokio::sync::Notify::new()),
+        }
     }
 
     fn mark_ready(&self) {
-        let _ = self.tx.send(true);
+        self.ready.store(true, Ordering::Release);
+        self.notify.notify_waiters();
     }
 
     async fn wait_until_ready(&self) {
-        if *self.tx.borrow() {
+        if self.ready.load(Ordering::Acquire) {
             return;
         }
 
-        let mut rx = self.tx.subscribe();
-        if *rx.borrow_and_update() {
-            return;
-        }
-
-        while rx.changed().await.is_ok() {
-            if *rx.borrow_and_update() {
+        loop {
+            let notified = self.notify.notified();
+            if self.ready.load(Ordering::Acquire) {
                 return;
             }
+            notified.await;
         }
     }
 }
@@ -78,6 +80,8 @@ fn client_message_requires_startup_readiness(msg: &ClientMessage) -> bool {
     !matches!(
         msg,
         ClientMessage::Ping
+            | ClientMessage::AgentGetConfig
+            | ClientMessage::AgentGetEffectiveConfigState
             | ClientMessage::GatewayRegister { .. }
             | ClientMessage::GatewayAck { .. }
             | ClientMessage::GatewayIncomingEvent { .. }
@@ -96,6 +100,33 @@ fn client_message_requires_startup_readiness(msg: &ClientMessage) -> bool {
             | ClientMessage::AgentGetOperationStatus { .. }
             | ClientMessage::AgentGetHealthStatus
     )
+}
+
+#[cfg(test)]
+mod startup_readiness_tests {
+    use super::*;
+
+    #[test]
+    fn config_requests_are_not_blocked_on_startup_readiness() {
+        assert!(!client_message_requires_startup_readiness(
+            &ClientMessage::AgentGetConfig
+        ));
+        assert!(!client_message_requires_startup_readiness(
+            &ClientMessage::AgentGetEffectiveConfigState
+        ));
+    }
+
+    #[tokio::test]
+    async fn cloned_startup_readiness_observes_mark_ready() {
+        let readiness = StartupReadiness::new(false);
+        let cloned = readiness.clone();
+
+        readiness.mark_ready();
+
+        tokio::time::timeout(std::time::Duration::from_millis(50), cloned.wait_until_ready())
+            .await
+            .expect("cloned startup readiness should observe mark_ready");
+    }
 }
 
 async fn handle_connection<S>(

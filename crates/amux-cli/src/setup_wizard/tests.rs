@@ -105,6 +105,39 @@ fn test_post_setup_choices_include_not_now() {
 }
 
 #[test]
+fn submit_key_recognizes_control_m_as_enter() {
+    assert!(terminal_ui::is_submit_key(
+        KeyCode::Char('m'),
+        KeyModifiers::CONTROL
+    ));
+}
+
+#[test]
+fn submit_key_recognizes_standard_enter() {
+    assert!(terminal_ui::is_submit_key(KeyCode::Enter, KeyModifiers::NONE));
+}
+
+#[test]
+fn submit_key_does_not_treat_plain_m_as_enter() {
+    assert!(!terminal_ui::is_submit_key(
+        KeyCode::Char('m'),
+        KeyModifiers::NONE
+    ));
+}
+
+#[test]
+fn raw_mode_guard_requests_full_keyboard_enhancement_flags() {
+    let flags = wizard_keyboard_enhancement_flags();
+
+    assert!(flags.contains(crossterm::event::KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES));
+    assert!(flags.contains(crossterm::event::KeyboardEnhancementFlags::REPORT_EVENT_TYPES));
+    assert!(flags.contains(crossterm::event::KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS));
+    assert!(flags.contains(
+        crossterm::event::KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES
+    ));
+}
+
+#[test]
 fn test_gateway_choice_items_include_whatsapp_and_skip() {
     let items = gateway_choice_items();
     assert_eq!(items.len(), 5);

@@ -328,6 +328,12 @@ pub struct BuiltinSubAgentOverrides {
     pub domowoj: BuiltinPersonaOverrides,
     #[serde(default)]
     pub swietowit: BuiltinPersonaOverrides,
+    #[serde(default)]
+    pub perun: BuiltinPersonaOverrides,
+    #[serde(default)]
+    pub mokosh: BuiltinPersonaOverrides,
+    #[serde(default)]
+    pub dazhbog: BuiltinPersonaOverrides,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

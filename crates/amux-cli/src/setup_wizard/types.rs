@@ -1,4 +1,8 @@
 use super::*;
+use crossterm::event::{
+    KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+};
+use crossterm::ExecutableCommand;
 
 #[derive(Debug, Clone, serde::Deserialize)]
 pub(super) struct ProviderAuthState {
@@ -38,17 +42,44 @@ pub(super) enum WhatsAppLinkAttemptOutcome {
     CancelledByUser,
 }
 
-pub(super) struct RawModeGuard;
+pub(super) fn wizard_keyboard_enhancement_flags() -> KeyboardEnhancementFlags {
+    KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+        | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
+        | KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS
+        | KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES
+}
+
+pub(super) struct RawModeGuard {
+    keyboard_enhancement_enabled: bool,
+}
 
 impl RawModeGuard {
     pub(super) fn new() -> Result<Self> {
         terminal::enable_raw_mode().context("Failed to enable raw mode")?;
-        Ok(Self)
+        let keyboard_enhancement_enabled = matches!(
+            crossterm::terminal::supports_keyboard_enhancement(),
+            Ok(true)
+        );
+
+        if keyboard_enhancement_enabled {
+            let mut stdout = io::stdout();
+            let _ = stdout.execute(PushKeyboardEnhancementFlags(
+                wizard_keyboard_enhancement_flags(),
+            ));
+        }
+
+        Ok(Self {
+            keyboard_enhancement_enabled,
+        })
     }
 }
 
 impl Drop for RawModeGuard {
     fn drop(&mut self) {
+        if self.keyboard_enhancement_enabled {
+            let mut stdout = io::stdout();
+            let _ = stdout.execute(PopKeyboardEnhancementFlags);
+        }
         let _ = terminal::disable_raw_mode();
     }
 }

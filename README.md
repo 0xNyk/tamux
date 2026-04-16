@@ -100,6 +100,9 @@ tamux gives its daemon-side agents a slightly mythic face, but the work stays co
 - **Radogost** is the negotiator: tradeoff analysis, comparison, and routing toward the strongest next move
 - **Domowoj** is the keeper: local stability, cleanup, careful repair, and environment-aware fixes
 - **Swietowit** is the wide watcher: broader architectural awareness and thread-level situational context
+- **Perun** is the thunder hand: decisive execution, infrastructure discipline, and security-minded action
+- **Mokosh** is the earth keeper: maintenance, reliability, and durable operational care
+- **Dazhbog** is the bright giver: synthesis, explanation, and turning ambiguity into a useful next move
 
 ### Working With Them
 
@@ -109,6 +112,9 @@ Examples:
 
 - `@weles verify claims before answering`
 - `@swarozyc review svarog's implementation and step in when needed`
+- `@perun drive the risky migration plan to a concrete decision`
+- `@mokosh stabilize this workspace and clean up the rough edges`
+- `@dazhbog turn this discussion into a clear plan and operator update`
 
 Behavior:
 
@@ -124,6 +130,8 @@ Examples:
 
 - `!weles check whether this is risky`
 - `!radogost compare these two approaches before we answer`
+- `!perun assess the operational blast radius before we proceed`
+- `!dazhbog summarize the strongest next move in plain language`
 
 Behavior:
 
@@ -141,13 +149,15 @@ Behavior:
 
 ### Registration And Setup
 
-Builtin personas such as `@swarozyc`, `@radogost`, `@domowoj`, and `@swietowit` need their own provider and model configuration before they can participate or receive internal DM.
+Builtin personas such as `@swarozyc`, `@radogost`, `@domowoj`, `@swietowit`, `@perun`, `@mokosh`, and `@dazhbog` need their own provider and model configuration before they can participate or receive internal DM.
 
 If one of those personas is available but not configured yet:
 
 - the desktop app opens a provider then model setup flow
 - the TUI opens the same provider then model picker flow
 - after setup, tamux retries the original `@agent ...` or `!agent ...` request automatically
+
+`@veles` is accepted as an alias for `@weles`, matching the existing `swarog` and `svarog` alias handling.
 
 If the target is not a known built-in persona or registered sub-agent alias, the leading `@agent` form is not treated as an agent directive and remains a normal message/file-mention path.
 

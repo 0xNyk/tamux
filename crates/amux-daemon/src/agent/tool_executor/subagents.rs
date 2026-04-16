@@ -647,6 +647,30 @@ async fn execute_list_agents(agent: &AgentEngine) -> Result<String> {
             "model": config.builtin_sub_agents.swietowit.model.clone(),
             "switchable": true
         }),
+        serde_json::json!({
+            "agent": crate::agent::agent_identity::PERUN_AGENT_ID,
+            "name": crate::agent::agent_identity::PERUN_AGENT_NAME,
+            "kind": "builtin",
+            "provider": config.builtin_sub_agents.perun.provider.clone(),
+            "model": config.builtin_sub_agents.perun.model.clone(),
+            "switchable": true
+        }),
+        serde_json::json!({
+            "agent": crate::agent::agent_identity::MOKOSH_AGENT_ID,
+            "name": crate::agent::agent_identity::MOKOSH_AGENT_NAME,
+            "kind": "builtin",
+            "provider": config.builtin_sub_agents.mokosh.provider.clone(),
+            "model": config.builtin_sub_agents.mokosh.model.clone(),
+            "switchable": true
+        }),
+        serde_json::json!({
+            "agent": crate::agent::agent_identity::DAZHBOG_AGENT_ID,
+            "name": crate::agent::agent_identity::DAZHBOG_AGENT_NAME,
+            "kind": "builtin",
+            "provider": config.builtin_sub_agents.dazhbog.provider.clone(),
+            "model": config.builtin_sub_agents.dazhbog.model.clone(),
+            "switchable": true
+        }),
     ];
 
     for sub_agent in agent.list_sub_agents().await {

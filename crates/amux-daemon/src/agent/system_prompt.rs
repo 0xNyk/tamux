@@ -157,7 +157,10 @@ pub(super) fn build_system_prompt(
          - Prefer `read_memory`, `read_user`, and `read_soul` for memory recall before raw file reads. They return structured JSON and avoid duplicating already injected fresh base markdown.\n\
          - Use `session_search` or `onecontext_search` when the user asks about prior decisions, existing implementations, or historical debugging context.\n\
          - Use `semantic_query` when you need local package/crate summaries, compose service topology, code import relationships, or learned workspace conventions before editing.\n\
+         - Before big or multi-step work, write or update a short working spec in `/tmp/*.md` capturing scope, constraints, plan, and open questions before implementation starts.\n\
+         - Before proceeding after a pause, handoff, or context shift, look up and reread the relevant `/tmp/*.md` spec so execution stays anchored to the latest written plan.\n\
          - For any non-trivial or multi-step task, call `update_todo` early to enter plan mode, then keep that todo list current as work progresses.\n\
+         - Create a general specs todo for big work, keep follow-up items visible, and continue following up on spawned/background tasks until each one is resolved, explicitly blocked, or cancelled.\n\
          - When you learn durable operator preferences or stable project facts, call `update_memory` with a concise update so future sessions start with that context.\n\
          - Memory files have hard limits: SOUL.md 1500 chars, MEMORY.md 2200 chars, USER.md 1375 chars.\n",
     );
@@ -680,5 +683,39 @@ mod tests {
             !prompt.contains("consult MEMORY.md and USER.md"),
             "system prompt should not keep the old raw-file-first memory guidance"
         );
+    }
+
+    #[tokio::test]
+    async fn system_prompt_requires_tmp_spec_and_task_followthrough_for_big_work() {
+        let root = tempfile::tempdir().expect("tempdir should succeed");
+        let manager = crate::session_manager::SessionManager::new_test(root.path()).await;
+        let engine =
+            crate::agent::AgentEngine::new_test(manager, AgentConfig::default(), root.path()).await;
+
+        let prompt = build_system_prompt(
+            &AgentConfig::default(),
+            "Base prompt",
+            &crate::agent::types::AgentMemory::default(),
+            &crate::agent::task_prompt::memory_paths_for_scope(
+                root.path(),
+                crate::agent::agent_identity::MAIN_AGENT_ID,
+            ),
+            crate::agent::agent_identity::MAIN_AGENT_ID,
+            &engine.list_sub_agents().await,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+
+        assert!(prompt.contains("write or update a short working spec in `/tmp/*.md`"));
+        assert!(prompt.contains("look up and reread the relevant `/tmp/*.md` spec"));
+        assert!(prompt.contains("Create a general specs todo for big work"));
+        assert!(prompt.contains(
+            "continue following up on spawned/background tasks until each one is resolved"
+        ));
     }
 }

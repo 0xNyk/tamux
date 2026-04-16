@@ -398,6 +398,8 @@ pub(crate) fn refresh_operator_satisfaction(model: &mut OperatorModel) {
         + model.implicit_feedback.revision_message_count as f64 * 0.10
         + model.implicit_feedback.correction_message_count as f64 * 0.16
         + model.implicit_feedback.fast_denial_count as f64 * 0.18
+        + model.implicit_feedback.rapid_revert_count as f64 * 0.20
+        + model.implicit_feedback.session_abandon_count as f64 * 0.14
         + model.attention_topology.rapid_switch_count.min(10) as f64 * 0.03;
 
     let score = normalize_satisfaction_score(approval_base_score(model) - friction);
@@ -439,4 +441,6 @@ pub(crate) fn has_operator_satisfaction_signal(model: &OperatorModel) -> bool {
         || model.implicit_feedback.revision_message_count > 0
         || model.implicit_feedback.correction_message_count > 0
         || model.implicit_feedback.fast_denial_count > 0
+        || model.implicit_feedback.rapid_revert_count > 0
+        || model.implicit_feedback.session_abandon_count > 0
 }

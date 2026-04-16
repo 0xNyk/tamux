@@ -27,7 +27,8 @@ use super::session_recall::execute_session_search as run_session_search;
 use super::tool_synthesis::{
     activate_generated_tool, detect_cli_wrapper_synthesis_proposal,
     detect_cli_wrapper_synthesis_proposal_from_command, execute_generated_tool,
-    find_equivalent_generated_cli_tool, generated_tool_definitions,
+    find_equivalent_generated_cli_tool, find_equivalent_generated_openapi_tool,
+    generated_tool_definitions,
     list_generated_tools, promote_generated_tool, synthesize_tool,
 };
 

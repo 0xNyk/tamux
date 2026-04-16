@@ -30,8 +30,6 @@ agents.md
 Thumbs.db
 $ROOT
 # Env
-.env
-.env.local
 PUBLISH.md
 # Logs
 *.log
@@ -43,3 +41,5 @@ dist-release/tamux-mcp.exe
 dist-release/tamux-portable.exe
 dist-release/tamux.exe
 .planning/
+config.bat
+node_modules

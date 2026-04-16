@@ -1,4 +1,5 @@
 use super::*;
+use crate::history::IntentPredictionRow;
 use crate::session_manager::SessionManager;
 use tempfile::tempdir;
 use tokio::time::{timeout, Duration};
@@ -370,6 +371,86 @@ async fn strained_satisfaction_suppresses_optional_morning_brief() {
 }
 
 #[tokio::test]
+async fn tool_hesitation_suppresses_optional_morning_brief() {
+    let root = tempdir().unwrap();
+    let manager = SessionManager::new_test(root.path()).await;
+    let mut config = AgentConfig::default();
+    config.anticipatory.enabled = true;
+    config.anticipatory.morning_brief = true;
+    let engine = AgentEngine::new_test(manager, config, root.path()).await;
+
+    let now = now_millis();
+    let mut goal = sample_goal_run("goal-hesitation-brief", Some("thread-hesitation-brief"));
+    goal.title = "Resume degraded flow".to_string();
+    goal.status = GoalRunStatus::Running;
+    goal.updated_at = now;
+    goal.current_step_title = Some("retry the command".to_string());
+    engine.goal_runs.lock().await.push_back(goal);
+    {
+        let mut model = engine.operator_model.write().await;
+        model.cognitive_style.message_count = 1;
+        model.implicit_feedback.tool_hesitation_count = 1;
+        refresh_operator_satisfaction(&mut model);
+    }
+    engine.mark_operator_present("test").await;
+
+    engine.run_anticipatory_tick().await;
+
+    assert!(
+        engine
+            .anticipatory
+            .read()
+            .await
+            .items
+            .iter()
+            .all(|item| item.kind != "morning_brief"),
+        "tool hesitation should suppress optional morning briefs to reduce proactive noise"
+    );
+}
+
+#[tokio::test]
+async fn slow_approval_latency_suppresses_optional_intent_prediction() {
+    let root = tempdir().unwrap();
+    let manager = SessionManager::new_test(root.path()).await;
+    let mut config = AgentConfig::default();
+    config.anticipatory.enabled = true;
+    config.anticipatory.stuck_detection = true;
+    let engine = AgentEngine::new_test(manager, config, root.path()).await;
+
+    let mut task = sample_task("task-latency-intent", Some("thread-latency-intent"), None);
+    task.title = "Need approval".to_string();
+    task.status = TaskStatus::AwaitingApproval;
+    engine.tasks.lock().await.push_back(task);
+    engine
+        .record_operator_attention("conversation:chat", Some("thread-latency-intent"), None)
+        .await
+        .unwrap();
+    {
+        let mut model = engine.operator_model.write().await;
+        model.cognitive_style.message_count = 1;
+        model.risk_fingerprint.approval_requests = 4;
+        model.risk_fingerprint.approvals = 2;
+        model.risk_fingerprint.denials = 2;
+        model.risk_fingerprint.avg_response_time_secs = 45.0;
+        refresh_risk_metrics(&mut model.risk_fingerprint);
+        refresh_operator_satisfaction(&mut model);
+    }
+
+    engine.run_anticipatory_tick().await;
+
+    assert!(
+        engine
+            .anticipatory
+            .read()
+            .await
+            .items
+            .iter()
+            .all(|item| item.kind != "intent_prediction"),
+        "slow approval latency should suppress optional intent prediction to reduce proactive noise"
+    );
+}
+
+#[tokio::test]
 async fn strained_satisfaction_skips_predictive_hydration() {
     let root = tempdir().unwrap();
     let manager = SessionManager::new_test(root.path()).await;
@@ -428,6 +509,19 @@ async fn anticipatory_tick_surfaces_intent_prediction_for_pending_approval() {
         .into_iter()
         .find(|candidate| candidate.kind == "intent_prediction")
         .expect("expected an intent prediction item");
+    let payload = item
+        .intent_prediction
+        .as_ref()
+        .expect("intent prediction payload should be present");
+    assert_eq!(payload.primary_action, "review pending approval");
+    assert_eq!(
+        payload.ranked_actions.len(),
+        3,
+        "intent prediction should surface ranked next actions"
+    );
+    assert_eq!(payload.ranked_actions[0].rank, 1);
+    assert_eq!(payload.ranked_actions[0].action, "review pending approval");
+    assert!(payload.ranked_actions[0].confidence >= 0.86);
     assert_eq!(item.thread_id.as_deref(), Some("thread-intent"));
     assert!(item.summary.contains("review pending approval"));
     assert!(item.confidence >= 0.86);
@@ -472,6 +566,24 @@ async fn anticipatory_tick_surfaces_intent_prediction_for_repo_change_context() 
         .into_iter()
         .find(|candidate| candidate.kind == "intent_prediction")
         .expect("expected an intent prediction item");
+    let payload = item
+        .intent_prediction
+        .as_ref()
+        .expect("intent prediction payload should be present");
+    assert_eq!(
+        payload.primary_action,
+        "inspect or test recent repo changes"
+    );
+    assert_eq!(
+        payload.ranked_actions.len(),
+        3,
+        "intent prediction should surface ranked next actions"
+    );
+    assert_eq!(payload.ranked_actions[0].rank, 1);
+    assert_eq!(
+        payload.ranked_actions[0].action,
+        "inspect or test recent repo changes"
+    );
     assert_eq!(item.thread_id.as_deref(), Some("thread-repo-intent"));
     assert!(item.summary.contains("inspect or test recent repo changes"));
     assert!(item
@@ -508,6 +620,100 @@ async fn strained_satisfaction_suppresses_intent_prediction() {
         .items
         .iter()
         .all(|item| item.kind != "intent_prediction"));
+}
+
+#[tokio::test]
+async fn tool_hesitation_tightens_predictive_hydration_to_active_attention_thread() {
+    let root = tempdir().unwrap();
+    let manager = SessionManager::new_test(root.path()).await;
+    let mut config = AgentConfig::default();
+    config.anticipatory.enabled = true;
+    config.anticipatory.predictive_hydration = true;
+    let engine = AgentEngine::new_test(manager, config, root.path()).await;
+
+    engine
+        .record_operator_attention("conversation:chat", Some("thread-focus"), None)
+        .await
+        .unwrap();
+
+    let now = now_millis();
+    let mut focused_goal = sample_goal_run("goal-focus", Some("thread-focus"));
+    focused_goal.status = GoalRunStatus::Running;
+    focused_goal.updated_at = now;
+    engine.goal_runs.lock().await.push_back(focused_goal);
+
+    let mut other_goal = sample_goal_run("goal-other", Some("thread-other"));
+    other_goal.status = GoalRunStatus::Running;
+    other_goal.updated_at = now.saturating_sub(1_000);
+    engine.goal_runs.lock().await.push_back(other_goal);
+
+    {
+        let mut model = engine.operator_model.write().await;
+        model.cognitive_style.message_count = 1;
+        model.implicit_feedback.tool_hesitation_count = 1;
+        refresh_operator_satisfaction(&mut model);
+    }
+
+    engine.run_anticipatory_tick().await;
+
+    let hydration = engine.anticipatory.read().await.hydration_by_thread.clone();
+    assert!(
+        hydration.contains_key("thread-focus"),
+        "active attention thread should still be hydrated"
+    );
+    assert!(
+        !hydration.contains_key("thread-other"),
+        "tool hesitation should tighten predictive hydration to the active attention thread"
+    );
+}
+
+#[tokio::test]
+async fn slow_approval_latency_tightens_predictive_hydration_to_active_attention_thread() {
+    let root = tempdir().unwrap();
+    let manager = SessionManager::new_test(root.path()).await;
+    let mut config = AgentConfig::default();
+    config.anticipatory.enabled = true;
+    config.anticipatory.predictive_hydration = true;
+    let engine = AgentEngine::new_test(manager, config, root.path()).await;
+
+    engine
+        .record_operator_attention("conversation:chat", Some("thread-focus"), None)
+        .await
+        .unwrap();
+
+    let now = now_millis();
+    let mut focused_goal = sample_goal_run("goal-focus", Some("thread-focus"));
+    focused_goal.status = GoalRunStatus::Running;
+    focused_goal.updated_at = now;
+    engine.goal_runs.lock().await.push_back(focused_goal);
+
+    let mut other_goal = sample_goal_run("goal-other", Some("thread-other"));
+    other_goal.status = GoalRunStatus::Running;
+    other_goal.updated_at = now.saturating_sub(1_000);
+    engine.goal_runs.lock().await.push_back(other_goal);
+
+    {
+        let mut model = engine.operator_model.write().await;
+        model.cognitive_style.message_count = 1;
+        model.risk_fingerprint.approval_requests = 4;
+        model.risk_fingerprint.approvals = 2;
+        model.risk_fingerprint.denials = 2;
+        model.risk_fingerprint.avg_response_time_secs = 45.0;
+        refresh_risk_metrics(&mut model.risk_fingerprint);
+        refresh_operator_satisfaction(&mut model);
+    }
+
+    engine.run_anticipatory_tick().await;
+
+    let hydration = engine.anticipatory.read().await.hydration_by_thread.clone();
+    assert!(
+        hydration.contains_key("thread-focus"),
+        "active attention thread should still be hydrated"
+    );
+    assert!(
+        !hydration.contains_key("thread-other"),
+        "slow approval latency should tighten predictive hydration to the active attention thread"
+    );
 }
 
 #[tokio::test]
@@ -568,6 +774,207 @@ async fn predictive_hydration_populates_prewarm_cache_for_hydrated_thread() {
 }
 
 #[tokio::test]
+async fn resolved_intent_predictions_raise_future_prediction_confidence() {
+    let root = tempdir().unwrap();
+    let manager = SessionManager::new_test(root.path()).await;
+    let mut config = AgentConfig::default();
+    config.anticipatory.enabled = true;
+    let engine = AgentEngine::new_test(manager, config, root.path()).await;
+
+    engine
+        .record_operator_attention("conversation:chat", Some("thread-confidence"), None)
+        .await
+        .unwrap();
+
+    let mut task = sample_task("task-confidence", Some("thread-confidence"), None);
+    task.title = "Need approval".to_string();
+    task.status = TaskStatus::AwaitingApproval;
+    engine.tasks.lock().await.push_back(task);
+
+    for (id, was_correct, created_at_ms) in [
+        ("intent-hist-1", true, 100),
+        ("intent-hist-2", true, 200),
+        ("intent-hist-3", false, 300),
+    ] {
+        engine
+            .history
+            .insert_intent_prediction(&IntentPredictionRow {
+                id: id.to_string(),
+                session_id: "thread-other".to_string(),
+                context_state_hash: format!("ctx-{id}"),
+                predicted_action: "review pending approval".to_string(),
+                confidence: 0.80,
+                actual_action: Some("review pending approval".to_string()),
+                was_correct: Some(was_correct),
+                created_at_ms,
+            })
+            .await
+            .expect("seed resolved prediction history");
+    }
+
+    engine.run_anticipatory_tick().await;
+
+    let item = engine
+        .anticipatory
+        .read()
+        .await
+        .items
+        .clone()
+        .into_iter()
+        .find(|candidate| candidate.kind == "intent_prediction")
+        .expect("expected intent prediction item");
+    let payload = item
+        .intent_prediction
+        .as_ref()
+        .expect("intent prediction payload should be present");
+
+    assert!(
+        payload.confidence > 0.86,
+        "persisted success-rate priors should raise confidence above the raw heuristic baseline"
+    );
+    assert_eq!(payload.primary_action, "review pending approval");
+}
+
+#[tokio::test]
+async fn intent_prediction_persists_and_resolves_when_operator_action_matches() {
+    let root = tempdir().unwrap();
+    let manager = SessionManager::new_test(root.path()).await;
+    let mut config = AgentConfig::default();
+    config.anticipatory.enabled = true;
+    config.operator_model.enabled = true;
+    config.operator_model.allow_message_statistics = true;
+    let engine = AgentEngine::new_test(manager, config, root.path()).await;
+
+    let mut task = sample_task("task-approval-persist", Some("thread-intent-persist"), None);
+    task.title = "Need approval".to_string();
+    task.status = TaskStatus::AwaitingApproval;
+    engine.tasks.lock().await.push_back(task);
+    engine
+        .record_operator_attention("conversation:chat", Some("thread-intent-persist"), None)
+        .await
+        .unwrap();
+
+    engine.run_anticipatory_tick().await;
+
+    let before = engine
+        .history
+        .list_intent_predictions("thread-intent-persist", 10)
+        .await
+        .expect("list persisted intent predictions before resolution");
+    assert_eq!(before.len(), 1);
+    assert_eq!(before[0].predicted_action, "review pending approval");
+    assert_eq!(before[0].was_correct, None);
+
+    engine
+        .record_operator_message(
+            "thread-intent-persist",
+            "please review the approval first",
+            false,
+        )
+        .await
+        .expect("record operator message");
+
+    let after = engine
+        .history
+        .list_intent_predictions("thread-intent-persist", 10)
+        .await
+        .expect("list persisted intent predictions after resolution");
+    assert_eq!(after.len(), 1);
+    assert_eq!(
+        after[0].actual_action.as_deref(),
+        Some("review pending approval")
+    );
+    assert_eq!(after[0].was_correct, Some(true));
+}
+
+#[tokio::test]
+async fn system_outcome_foresight_persists_and_resolves_when_health_feedback_arrives() {
+    let root = tempdir().unwrap();
+    let repo_root = root.path().join("repo-foresight-persist");
+    std::fs::create_dir_all(&repo_root).unwrap();
+    std::process::Command::new("git")
+        .args(["init"])
+        .current_dir(&repo_root)
+        .output()
+        .expect("git init");
+    std::fs::write(
+        repo_root.join("Cargo.toml"),
+        "[package]\nname='demo'\nversion='0.1.0'\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(repo_root.join("src")).unwrap();
+    std::fs::write(repo_root.join("src/lib.rs"), "pub fn broken() {}\n").unwrap();
+
+    let manager = SessionManager::new_test(root.path()).await;
+    let mut config = AgentConfig::default();
+    config.anticipatory.enabled = true;
+    let engine = AgentEngine::new_test(manager, config, root.path()).await;
+
+    engine
+        .record_operator_attention("conversation:chat", Some("thread-foresight-persist"), None)
+        .await
+        .unwrap();
+    engine.thread_work_contexts.write().await.insert(
+        "thread-foresight-persist".to_string(),
+        ThreadWorkContext {
+            thread_id: "thread-foresight-persist".to_string(),
+            entries: vec![WorkContextEntry {
+                path: "src/lib.rs".to_string(),
+                previous_path: None,
+                kind: WorkContextEntryKind::RepoChange,
+                source: "repo_scan".to_string(),
+                change_kind: Some("modified".to_string()),
+                repo_root: Some(repo_root.to_string_lossy().to_string()),
+                goal_run_id: None,
+                step_index: None,
+                session_id: None,
+                is_text: true,
+                updated_at: now_millis(),
+            }],
+        },
+    );
+    engine
+        .history
+        .insert_health_log(
+            "health-foresight-persist-degraded",
+            "task",
+            "cargo-test",
+            "degraded",
+            Some("{\"tool\":\"cargo test\",\"error\":\"Command failed\"}"),
+            Some("recent cargo test failed in this repo"),
+            now_millis(),
+        )
+        .await
+        .expect("save degraded health log");
+
+    engine.run_anticipatory_tick().await;
+
+    let before = engine
+        .history
+        .list_system_outcome_predictions("thread-foresight-persist", 10)
+        .await
+        .expect("list persisted system outcome predictions before resolution");
+    assert_eq!(before.len(), 1);
+    assert_eq!(before[0].prediction_type, "build_test_risk");
+    assert_eq!(before[0].predicted_outcome, "build/test failure");
+    assert!(before[0].confidence >= 0.7);
+    assert_eq!(before[0].was_correct, None);
+
+    engine
+        .resolve_system_outcome_prediction_feedback("thread-foresight-persist", "healthy")
+        .await;
+
+    let after = engine
+        .history
+        .list_system_outcome_predictions("thread-foresight-persist", 10)
+        .await
+        .expect("list persisted system outcome predictions after resolution");
+    assert_eq!(after.len(), 1);
+    assert_eq!(after[0].actual_outcome.as_deref(), Some("healthy"));
+    assert_eq!(after[0].was_correct, Some(false));
+}
+
+#[tokio::test]
 async fn intent_prediction_includes_cached_prewarm_summary_when_available() {
     let root = tempdir().unwrap();
     let manager = SessionManager::new_test(root.path()).await;
@@ -612,6 +1019,14 @@ async fn intent_prediction_includes_cached_prewarm_summary_when_available() {
         .into_iter()
         .find(|candidate| candidate.kind == "intent_prediction")
         .expect("expected an intent prediction item");
+    let payload = item
+        .intent_prediction
+        .as_ref()
+        .expect("intent prediction payload should be present");
+    assert!(payload
+        .ranked_actions
+        .iter()
+        .any(|candidate| candidate.rationale.contains("Cached prewarm")));
     assert!(item
         .bullets
         .iter()

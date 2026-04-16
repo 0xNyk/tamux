@@ -584,6 +584,58 @@ fn collect_thread_structural_candidates(
     language_hints_truncated || entries_truncated
 }
 
+fn preferred_thread_structural_refs_for_query(
+    structural_memory: &crate::agent::context::structural_memory::ThreadStructuralMemory,
+    query: &str,
+    limit: usize,
+) -> Vec<String> {
+    let query_lower = query.to_ascii_lowercase();
+    let tokens = query_tokens(query);
+    structural_memory
+        .concise_context_entries(&[], usize::MAX)
+        .into_iter()
+        .filter(|entry| {
+            let haystack = format!("{} {}", entry.node_id, entry.summary).to_ascii_lowercase();
+            haystack.contains(&query_lower)
+                || tokens.iter().all(|token| haystack.contains(token))
+        })
+        .map(|entry| entry.node_id)
+        .take(limit)
+        .collect()
+}
+
+fn collect_thread_structural_graph_lookup_candidates(
+    candidates: &mut Vec<MemorySearchCandidate>,
+    structural_memory: &crate::agent::context::structural_memory::ThreadStructuralMemory,
+    preferred_refs: &[String],
+    limit: usize,
+) {
+    let mut seen = std::collections::HashSet::new();
+    for preferred_ref in preferred_refs.iter().take(limit) {
+        for neighbor in structural_memory.graph_neighbors(preferred_ref, limit) {
+            if !seen.insert((neighbor.node_id.clone(), neighbor.relation_kind.clone())) {
+                continue;
+            }
+            candidates.push(MemorySearchCandidate {
+                layer: "thread_structural_memory",
+                source: neighbor.node_id.clone(),
+                snippet: format!("Graph lookup from {preferred_ref}: {}", neighbor.summary),
+                haystack: format!(
+                    "{preferred_ref} {} {} {}",
+                    neighbor.node_id, neighbor.relation_kind, neighbor.summary
+                ),
+                rank_weight: None,
+                updated_at_ms: None,
+                injected_updated_at_ms: None,
+                freshness_status: "unknown",
+            });
+            if candidates.len() >= MEMORY_SEARCH_MAX_CANDIDATES_PER_LAYER {
+                return;
+            }
+        }
+    }
+}
+
 async fn load_thread_memory_graph_neighbors(
     agent: &AgentEngine,
     structural_memory: &crate::agent::context::structural_memory::ThreadStructuralMemory,
@@ -858,6 +910,7 @@ async fn execute_memory_read_tool(
                 .take(request.limit_per_layer)
                 .cloned()
                 .collect::<Vec<_>>();
+            let graph_lookup = structural_memory.graph_lookup(&[], request.limit_per_layer);
             let graph_neighbors = load_thread_memory_graph_neighbors(
                 agent,
                 &structural_memory,
@@ -875,6 +928,15 @@ async fn execute_memory_read_tool(
                         .map(|entry| serde_json::json!({
                             "node_id": entry.node_id,
                             "summary": entry.summary,
+                        }))
+                        .collect::<Vec<_>>(),
+                    "graph_lookup": graph_lookup
+                        .into_iter()
+                        .map(|neighbor| serde_json::json!({
+                            "node_id": neighbor.node_id,
+                            "relation_kind": neighbor.relation_kind,
+                            "direction": neighbor.direction,
+                            "summary": neighbor.summary,
                         }))
                         .collect::<Vec<_>>(),
                     "graph_neighbors": graph_neighbors
@@ -1095,6 +1157,17 @@ async fn execute_memory_search_tool(
             let mut structural_candidates = Vec::new();
             collection_truncated |=
                 collect_thread_structural_candidates(&mut structural_candidates, structural_memory.clone());
+            let preferred_refs = preferred_thread_structural_refs_for_query(
+                &structural_memory,
+                &request.query,
+                MEMORY_SEARCH_MAX_CANDIDATES_PER_LAYER,
+            );
+            collect_thread_structural_graph_lookup_candidates(
+                &mut structural_candidates,
+                &structural_memory,
+                &preferred_refs,
+                MEMORY_SEARCH_MAX_CANDIDATES_PER_LAYER,
+            );
             let graph_neighbors = load_thread_memory_graph_neighbors(
                 agent,
                 &structural_memory,

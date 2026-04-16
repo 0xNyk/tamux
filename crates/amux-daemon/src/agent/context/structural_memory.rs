@@ -70,6 +70,14 @@ pub struct StructuralEdge {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StructuralGraphNeighbor {
+    pub node_id: String,
+    pub relation_kind: String,
+    pub direction: String,
+    pub summary: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StructuralContextEntry {
     pub node_id: String,
     pub summary: String,
@@ -176,6 +184,78 @@ impl ThreadStructuralMemory {
                 node_id,
             })
             .collect()
+    }
+
+    pub fn graph_neighbors(&self, node_id: &str, limit: usize) -> Vec<StructuralGraphNeighbor> {
+        if limit == 0 || !self.knows_node(node_id) {
+            return Vec::new();
+        }
+
+        let mut neighbors = self
+            .edges
+            .iter()
+            .filter_map(|edge| {
+                if edge.from == node_id {
+                    Some(StructuralGraphNeighbor {
+                        node_id: edge.to.clone(),
+                        relation_kind: edge.kind.clone(),
+                        direction: "outgoing".to_string(),
+                        summary: format!(
+                            "{} -> {}",
+                            edge.kind.replace('_', " "),
+                            self.describe_context_node(&edge.to)
+                        ),
+                    })
+                } else if edge.to == node_id {
+                    Some(StructuralGraphNeighbor {
+                        node_id: edge.from.clone(),
+                        relation_kind: edge.kind.clone(),
+                        direction: "incoming".to_string(),
+                        summary: format!(
+                            "{} <- {}",
+                            edge.kind.replace('_', " "),
+                            self.describe_context_node(&edge.from)
+                        ),
+                    })
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+
+        neighbors.sort_by(|left, right| {
+            left.relation_kind
+                .cmp(&right.relation_kind)
+                .then(left.direction.cmp(&right.direction))
+                .then(left.node_id.cmp(&right.node_id))
+        });
+        neighbors.truncate(limit);
+        neighbors
+    }
+
+    pub fn graph_lookup(
+        &self,
+        preferred_refs: &[String],
+        limit: usize,
+    ) -> Vec<StructuralGraphNeighbor> {
+        if limit == 0 || !self.has_structural_nodes() {
+            return Vec::new();
+        }
+
+        let anchor = preferred_refs
+            .iter()
+            .find(|node_id| self.knows_node(node_id))
+            .cloned()
+            .or_else(|| self.observed_files.first().map(|node| node.node_id.clone()))
+            .or_else(|| {
+                self.workspace_seeds
+                    .first()
+                    .map(|seed| seed.node_id.clone())
+            });
+        let Some(anchor) = anchor else {
+            return Vec::new();
+        };
+        self.graph_neighbors(&anchor, limit)
     }
 
     pub fn merge(&mut self, other: ThreadStructuralMemory) {

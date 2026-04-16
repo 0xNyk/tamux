@@ -215,6 +215,53 @@ fn build_debate_round_requests_from_existing_session() {
 }
 
 #[tokio::test]
+async fn start_debate_session_auto_runs_seeded_opening_round() {
+    let root = tempdir().expect("tempdir");
+    let manager = SessionManager::new_test(root.path()).await;
+    let mut config = AgentConfig::default();
+    config.debate.enabled = true;
+    let engine = AgentEngine::new_test(manager, config, root.path()).await;
+
+    let session_id = engine
+        .start_debate_session(
+            "cache strategy",
+            Some(sample_framings()),
+            "thread-1",
+            Some("goal-1"),
+        )
+        .await
+        .expect("start debate session");
+
+    let payload = engine
+        .get_debate_session_payload(&session_id)
+        .await
+        .expect("debate payload should load");
+
+    assert_eq!(payload["status"], "in_progress");
+    assert_eq!(payload["current_round"].as_u64(), Some(2));
+
+    let arguments = payload["arguments"]
+        .as_array()
+        .expect("arguments should be present after opening round seeding");
+    assert_eq!(arguments.len(), 3);
+    assert!(arguments
+        .iter()
+        .any(|argument| argument["role"] == "proponent"));
+    assert!(arguments
+        .iter()
+        .any(|argument| argument["role"] == "skeptic"));
+    assert!(arguments
+        .iter()
+        .any(|argument| argument["role"] == "synthesizer"));
+    assert!(arguments.iter().all(|argument| {
+        argument["round"].as_u64() == Some(1)
+            && argument["evidence_refs"]
+                .as_array()
+                .is_some_and(|refs| refs.len() >= 1)
+    }));
+}
+
+#[tokio::test]
 async fn dispatch_debate_round_request_persists_structured_argument() {
     let root = tempdir().expect("tempdir");
     let manager = SessionManager::new_test(root.path()).await;
@@ -254,7 +301,7 @@ async fn dispatch_debate_round_request_persists_structured_argument() {
 
     assert_eq!(payload["status"], "appended");
     assert_eq!(payload["session_id"], session_id);
-    assert_eq!(payload["round"], 1);
+    assert_eq!(payload["round"], 2);
     assert_eq!(payload["role"], "proponent");
     assert_eq!(payload["prompt"], request.prompt);
 
@@ -265,12 +312,16 @@ async fn dispatch_debate_round_request_persists_structured_argument() {
     let arguments = persisted["arguments"]
         .as_array()
         .expect("arguments should persist");
-    assert_eq!(arguments.len(), 1);
-    assert_eq!(arguments[0]["round"].as_u64(), Some(request.round as u64));
-    assert_eq!(arguments[0]["role"], "proponent");
-    assert_eq!(arguments[0]["agent_id"], request.agent_id);
+    assert_eq!(arguments.len(), 4);
+    let appended = arguments
+        .iter()
+        .find(|argument| argument["content"] == "Defend canary rollout with concrete evidence.")
+        .expect("manually dispatched debate argument should be present");
+    assert_eq!(appended["round"].as_u64(), Some(request.round as u64));
+    assert_eq!(appended["role"], "proponent");
+    assert_eq!(appended["agent_id"], request.agent_id);
     assert_eq!(
-        arguments[0]["content"],
+        appended["content"],
         "Defend canary rollout with concrete evidence."
     );
 }

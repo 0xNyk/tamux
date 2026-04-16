@@ -225,7 +225,7 @@ impl AgentEngine {
 
         if settings.morning_brief {
             if should_surface_anticipatory_kind("morning_brief", attention_surface.as_deref())
-                && adaptation_mode != AnticipatoryAdaptationMode::Minimal
+                && adaptation_mode == AnticipatoryAdaptationMode::Normal
             {
                 if let Some(item) = self.compute_morning_brief(settings).await {
                     items.push(item);
@@ -240,7 +240,7 @@ impl AgentEngine {
                 }
             }
         }
-        if adaptation_mode != AnticipatoryAdaptationMode::Minimal {
+        if adaptation_mode == AnticipatoryAdaptationMode::Normal {
             if should_surface_anticipatory_kind(
                 "system_outcome_foresight",
                 attention_surface.as_deref(),
@@ -250,7 +250,7 @@ impl AgentEngine {
                 }
             }
         }
-        if adaptation_mode != AnticipatoryAdaptationMode::Minimal {
+        if adaptation_mode == AnticipatoryAdaptationMode::Normal {
             if should_surface_anticipatory_kind("intent_prediction", attention_surface.as_deref()) {
                 if let Some(item) = self.compute_intent_prediction(settings).await {
                     items.push(item);
@@ -274,7 +274,22 @@ impl AgentEngine {
 
     async fn anticipatory_adaptation_mode(&self) -> AnticipatoryAdaptationMode {
         let model = self.operator_model.read().await;
-        AnticipatoryAdaptationMode::from_label(&model.operator_satisfaction.label)
+        let base = AnticipatoryAdaptationMode::from_label(&model.operator_satisfaction.label);
+        if base != AnticipatoryAdaptationMode::Normal {
+            return base;
+        }
+
+        if model.implicit_feedback.tool_hesitation_count > 0 {
+            return AnticipatoryAdaptationMode::Tightened;
+        }
+
+        if model.risk_fingerprint.approval_requests > 0
+            && model.risk_fingerprint.avg_response_time_secs >= 30.0
+        {
+            return AnticipatoryAdaptationMode::Tightened;
+        }
+
+        AnticipatoryAdaptationMode::Normal
     }
 
     async fn current_attention_surface(&self) -> Option<String> {
@@ -367,6 +382,17 @@ impl AgentEngine {
             return;
         }
 
+        let predicted_items = next_items
+            .iter()
+            .filter(|item| item.intent_prediction.is_some())
+            .cloned()
+            .collect::<Vec<_>>();
+        let outcome_items = next_items
+            .iter()
+            .filter(|item| item.kind == "system_outcome_foresight")
+            .cloned()
+            .collect::<Vec<_>>();
+
         let surface_cooldown_ms = settings.surface_cooldown_seconds.saturating_mul(1000);
         let cooling_down = runtime
             .last_surface_at
@@ -384,6 +410,14 @@ impl AgentEngine {
             runtime.last_surface_at = Some(now);
         }
         drop(runtime);
+
+        for item in &predicted_items {
+            self.persist_intent_prediction_if_present(item).await;
+        }
+        for item in &outcome_items {
+            self.persist_system_outcome_prediction_if_present(item)
+                .await;
+        }
 
         self.emit_anticipatory_update(next_items);
     }
@@ -494,6 +528,7 @@ impl AgentEngine {
             title: "Morning Brief".to_string(),
             summary: format!("{} item(s) worth picking up.", bullets.len()),
             bullets,
+            intent_prediction: None,
             confidence,
             goal_run_id: primary_goal.as_ref().map(|goal| goal.id.clone()),
             thread_id: primary_goal
@@ -559,6 +594,7 @@ impl AgentEngine {
                 summary: "The daemon sees a live task pattern that usually needs intervention."
                     .to_string(),
                 bullets: assessment.bullets,
+                intent_prediction: None,
                 confidence: assessment.confidence,
                 goal_run_id: task.goal_run_id.clone(),
                 thread_id: task.thread_id.clone().or(task.parent_thread_id.clone()),
@@ -628,6 +664,7 @@ impl AgentEngine {
                     "Weighted vote is likely recoverable without escalation.".to_string()
                 },
             ],
+            intent_prediction: None,
             confidence,
             goal_run_id: session.goal_run_id.clone(),
             thread_id: session.thread_id.clone(),
@@ -804,6 +841,7 @@ impl AgentEngine {
             bullets: std::iter::once(format!("rationale: {}", foresight.rationale))
                 .chain(foresight.bullets.into_iter())
                 .collect(),
+            intent_prediction: None,
             confidence: foresight.confidence,
             goal_run_id: None,
             thread_id: foresight.thread_id,
@@ -896,10 +934,59 @@ impl AgentEngine {
             }
         }
 
-        let (action, confidence, bullets) = predicted_action?;
+        let (action, base_confidence, bullets) = predicted_action?;
+        let learned_prior = self
+            .history
+            .recent_intent_prediction_success_rate(action, 8)
+            .await
+            .ok()
+            .flatten();
+        let confidence = learned_prior
+            .map(|prior| (base_confidence + ((prior - 0.5) * 0.15)).clamp(0.0, 0.99))
+            .unwrap_or(base_confidence);
         if confidence < settings.surfacing_min_confidence {
             return None;
         }
+
+        let mut ranked_actions = Vec::new();
+        ranked_actions.push(IntentPredictionCandidate {
+            rank: 1,
+            action: action.to_string(),
+            confidence,
+            rationale: bullets
+                .first()
+                .cloned()
+                .unwrap_or_else(|| "Primary heuristic matched current context.".to_string()),
+        });
+        if action != "review pending approval" {
+            ranked_actions.push(IntentPredictionCandidate {
+                rank: 2,
+                action: "review pending approval".to_string(),
+                confidence: 0.52,
+                rationale: "Approval-bound work is a common unblock step when active tasks stall."
+                    .to_string(),
+            });
+        } else {
+            ranked_actions.push(IntentPredictionCandidate {
+                rank: 2,
+                action: "inspect or test recent repo changes".to_string(),
+                confidence: 0.58,
+                rationale: "After approval resolution, verification of active repo changes is the next common follow-up."
+                    .to_string(),
+            });
+        }
+        ranked_actions.push(IntentPredictionCandidate {
+            rank: 3,
+            action: "continue the active thread".to_string(),
+            confidence: 0.44,
+            rationale: cached_prewarm
+                .as_ref()
+                .map(|cache| format!("Cached prewarm available: {}", cache.summary))
+                .unwrap_or_else(|| {
+                    "Conversation attention remains active even when stronger heuristics are absent."
+                        .to_string()
+                }),
+        });
 
         let route = self
             .resolve_anticipatory_route("intent_prediction", None, attention_thread_id.as_deref())
@@ -915,6 +1002,11 @@ impl AgentEngine {
             title: "Likely Next Action".to_string(),
             summary: format!("Predicted next step: {action}"),
             bullets,
+            intent_prediction: Some(IntentPredictionPayload {
+                primary_action: action.to_string(),
+                confidence,
+                ranked_actions,
+            }),
             confidence,
             goal_run_id: None,
             thread_id: attention_thread_id,

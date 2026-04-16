@@ -112,10 +112,21 @@ impl AgentEngine {
     }
 
     pub(crate) async fn reinforce_meta_cognitive_bias_occurrence(&self, bias_name: &str) {
-        let mut model = self.meta_cognitive_self_model.write().await;
-        if let Some(bias) = model.biases.iter_mut().find(|bias| bias.name == bias_name) {
-            bias.occurrence_count = bias.occurrence_count.saturating_add(1);
-            model.last_updated_ms = now_millis();
+        let maybe_model = {
+            let mut model = self.meta_cognitive_self_model.write().await;
+            if let Some(bias) = model.biases.iter_mut().find(|bias| bias.name == bias_name) {
+                bias.occurrence_count = bias.occurrence_count.saturating_add(1);
+                model.last_updated_ms = now_millis();
+                Some(model.clone())
+            } else {
+                None
+            }
+        };
+
+        if let Some(model) = maybe_model {
+            if let Err(error) = self.persist_meta_cognitive_self_model(&model).await {
+                tracing::warn!(bias_name = %bias_name, "failed to persist meta-cognitive bias reinforcement: {error}");
+            }
         }
     }
 
@@ -125,17 +136,28 @@ impl AgentEngine {
         predicted_band: ConfidenceBand,
     ) {
         let now = now_millis();
-        {
+        let model_to_persist = {
             let mut model = self.meta_cognitive_self_model.write().await;
             model.calibration_offset = (model.calibration_offset + adjustment).clamp(-0.35, 0.35);
             model.last_updated_ms = now;
-        }
+            model.clone()
+        };
         let predicted_success = predicted_band != ConfidenceBand::Guessing;
         self.calibration_tracker.write().await.record_observation(
             predicted_band,
             predicted_success,
             now,
         );
+
+        if let Err(error) = self
+            .persist_meta_cognitive_self_model(&model_to_persist)
+            .await
+        {
+            tracing::warn!(
+                adjustment,
+                "failed to persist meta-cognitive calibration update: {error}"
+            );
+        }
     }
 }
 

@@ -8,33 +8,30 @@ mod transport;
 use transport::orchestrator_policy_json_schema;
 
 impl AgentEngine {
-    async fn goal_planning_adaptation(&self) -> (SatisfactionAdaptationMode, Vec<String>) {
+    async fn goal_planning_adaptation(&self) -> BehaviorAdaptationProfile {
         let model = self.operator_model.read().await;
-        (
-            SatisfactionAdaptationMode::from_label(&model.operator_satisfaction.label),
-            preferred_tool_fallback_targets(&model.implicit_feedback.top_tool_fallbacks, 3),
-        )
+        BehaviorAdaptationProfile::from_model(&model)
     }
 
     fn apply_goal_plan_adaptation(
         &self,
         plan: &mut GoalPlanResponse,
-        adaptation: SatisfactionAdaptationMode,
+        adaptation: &BehaviorAdaptationProfile,
         is_replan: bool,
     ) {
         let max_steps = if is_replan {
-            adaptation.max_goal_replan_steps()
+            adaptation.mode.max_goal_replan_steps()
         } else {
-            adaptation.max_goal_plan_steps()
+            adaptation.mode.max_goal_plan_steps()
         };
         if plan.steps.len() > max_steps {
             plan.steps.truncate(max_steps);
         }
-        let max_rejected = adaptation.max_rejected_alternatives();
+        let max_rejected = adaptation.mode.max_rejected_alternatives();
         if plan.rejected_alternatives.len() > max_rejected {
             plan.rejected_alternatives.truncate(max_rejected);
         }
-        match adaptation {
+        match adaptation.mode {
             SatisfactionAdaptationMode::Minimal => {
                 plan.summary = format!(
                     "Conservative execution mode: prefer proven tools, keep iteration bounds short, and require explicit operator confirmation before broadening scope. {}",
@@ -71,7 +68,9 @@ impl AgentEngine {
     }
 
     pub(super) async fn request_goal_plan(&self, goal_run: &GoalRun) -> Result<GoalPlanResponse> {
-        let (adaptation_mode, preferred_fallback_tools) = self.goal_planning_adaptation().await;
+        let adaptation = self.goal_planning_adaptation().await;
+        let adaptation_mode = adaptation.mode;
+        let preferred_fallback_tools = adaptation.preferred_tool_fallbacks.clone();
         let max_steps = adaptation_mode.max_goal_plan_steps();
         let max_rejected = adaptation_mode.max_rejected_alternatives();
 
@@ -118,6 +117,16 @@ impl AgentEngine {
                 "\n- Operator satisfaction is fragile. Keep the plan compact, reduce speculative branching, and prefer proven paths over broad exploration.\n",
             ),
             SatisfactionAdaptationMode::Normal => {}
+        }
+        if adaptation.prompt_for_clarification {
+            prompt.push_str(
+                "- Recent implicit feedback indicates low confidence in guessed intent. When scope is ambiguous, prefer a targeted clarification checkpoint over guessing broadly.\n",
+            );
+        }
+        if adaptation.compact_response {
+            prompt.push_str(
+                "- Keep the plan summary and step instructions compact: front-load the conclusion and include only the detail needed to execute the next action.\n",
+            );
         }
         if !preferred_fallback_tools.is_empty() {
             prompt.push_str(&format!(
@@ -185,7 +194,7 @@ impl AgentEngine {
         }
 
         apply_plan_defaults(&mut plan);
-        self.apply_goal_plan_adaptation(&mut plan, adaptation_mode, false);
+        self.apply_goal_plan_adaptation(&mut plan, &adaptation, false);
 
         // Annotate plan steps with confidence labels (UNCR-01, Phase v3.0)
         self.annotate_plan_steps_with_confidence(
@@ -395,7 +404,9 @@ impl AgentEngine {
         goal_run: &GoalRun,
         failure: &str,
     ) -> Result<GoalPlanResponse> {
-        let (adaptation_mode, preferred_fallback_tools) = self.goal_planning_adaptation().await;
+        let adaptation = self.goal_planning_adaptation().await;
+        let adaptation_mode = adaptation.mode;
+        let preferred_fallback_tools = adaptation.preferred_tool_fallbacks.clone();
         let max_steps = adaptation_mode.max_goal_replan_steps();
         let max_rejected = adaptation_mode.max_rejected_alternatives();
         let completed = goal_run
@@ -437,6 +448,16 @@ impl AgentEngine {
                 "\nRecovery should be compact and conservative: reduce retries, keep breadth low, and favor proven paths over exploration.\n",
             ),
             SatisfactionAdaptationMode::Normal => {}
+        }
+        if adaptation.prompt_for_clarification {
+            prompt.push_str(
+                "When the failure suggests the operator intent may be underspecified, add a brief clarification checkpoint before broader recovery work.\n",
+            );
+        }
+        if adaptation.compact_response {
+            prompt.push_str(
+                "Keep the revised recovery summary and step instructions compact: front-load the conclusion and only include the detail needed for the next recovery action.\n",
+            );
         }
         if !preferred_fallback_tools.is_empty() {
             prompt.push_str(&format!(
@@ -484,7 +505,7 @@ impl AgentEngine {
         }
 
         apply_plan_defaults(&mut plan);
-        self.apply_goal_plan_adaptation(&mut plan, adaptation_mode, true);
+        self.apply_goal_plan_adaptation(&mut plan, &adaptation, true);
         self.annotate_plan_steps_with_confidence(
             &mut plan.steps,
             &goal_run.goal,

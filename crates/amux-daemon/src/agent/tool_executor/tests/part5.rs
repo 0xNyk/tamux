@@ -801,8 +801,17 @@ fn apply_patch_tool_uses_top_level_object_schema() {
         );
         assert_eq!(
             get_payload.get("current_round").and_then(|v| v.as_u64()),
-            Some(1)
+            Some(2)
         );
+        assert!(get_payload
+            .get("arguments")
+            .and_then(|v| v.as_array())
+            .is_some_and(|arguments| {
+                arguments.len() == 3
+                    && arguments.iter().any(|argument| argument["role"] == "proponent")
+                    && arguments.iter().any(|argument| argument["role"] == "skeptic")
+                    && arguments.iter().any(|argument| argument["role"] == "synthesizer")
+            }));
         assert!(get_payload
             .get("roles")
             .and_then(|v| v.as_array())

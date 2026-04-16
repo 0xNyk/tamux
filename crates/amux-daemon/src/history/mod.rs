@@ -229,6 +229,48 @@ pub struct SatisfactionScoreRow {
 }
 
 #[derive(Debug, Clone)]
+pub struct EventTriggerRow {
+    pub id: String,
+    pub event_family: String,
+    pub event_kind: String,
+    pub target_state: Option<String>,
+    pub thread_id: Option<String>,
+    pub enabled: bool,
+    pub cooldown_secs: u64,
+    pub risk_label: String,
+    pub notification_kind: String,
+    pub title_template: String,
+    pub body_template: String,
+    pub created_at: u64,
+    pub updated_at: u64,
+    pub last_fired_at: Option<u64>,
+}
+
+#[derive(Debug, Clone)]
+pub struct IntentPredictionRow {
+    pub id: String,
+    pub session_id: String,
+    pub context_state_hash: String,
+    pub predicted_action: String,
+    pub confidence: f64,
+    pub actual_action: Option<String>,
+    pub was_correct: Option<bool>,
+    pub created_at_ms: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct SystemOutcomePredictionRow {
+    pub id: String,
+    pub session_id: String,
+    pub prediction_type: String,
+    pub predicted_outcome: String,
+    pub confidence: f64,
+    pub actual_outcome: Option<String>,
+    pub was_correct: Option<bool>,
+    pub created_at_ms: u64,
+}
+
+#[derive(Debug, Clone)]
 pub struct OperatorProfileSessionRow {
     pub session_id: String,
     pub kind: String,
@@ -534,12 +576,21 @@ pub struct GenePoolEntry {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SkillVariantFitnessSnapshot {
+    pub recorded_at: u64,
+    pub fitness_score: f64,
+    pub use_count: u32,
+    pub success_rate: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SkillVariantInspection {
     pub record: SkillVariantRecord,
     pub lifecycle_summary: String,
     pub selection_summary: String,
     pub selected_for_context: bool,
     pub fitness_score: f64,
+    pub fitness_snapshot: SkillVariantFitnessSnapshot,
     pub fitness_history: Vec<SkillVariantFitnessHistoryRow>,
 }
 
@@ -725,6 +776,7 @@ mod context_archive;
 mod core;
 mod critique;
 mod debate;
+mod event_triggers;
 mod gateway_state;
 mod goal_runs;
 mod governance;

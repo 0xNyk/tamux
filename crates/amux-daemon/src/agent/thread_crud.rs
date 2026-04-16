@@ -5,6 +5,8 @@
 use super::*;
 use serde::{Deserialize, Serialize};
 
+const SESSION_ABANDON_WINDOW_MS: u64 = 30_000;
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct ThreadListFilter {
     pub created_after: Option<u64>,
@@ -288,8 +290,13 @@ impl AgentEngine {
     }
 
     pub async fn delete_thread(&self, thread_id: &str) -> bool {
+        let thread_snapshot = self.threads.read().await.get(thread_id).cloned();
         let removed = self.threads.write().await.remove(thread_id).is_some();
         if removed {
+            if let Some(thread) = thread_snapshot.as_ref() {
+                self.maybe_record_session_abandon_on_thread_delete(thread)
+                    .await;
+            }
             self.clear_thread_client_surface(thread_id).await;
             self.clear_thread_skill_discovery_state(thread_id).await;
             self.clear_thread_memory_injection_state(thread_id).await;
@@ -308,6 +315,60 @@ impl AgentEngine {
             self.persist_work_context().await;
         }
         removed
+    }
+
+    async fn maybe_record_session_abandon_on_thread_delete(&self, thread: &AgentThread) {
+        let now = now_millis();
+        let Some(last_assistant) = thread
+            .messages
+            .iter()
+            .rev()
+            .find(|message| message.role == MessageRole::Assistant)
+        else {
+            return;
+        };
+
+        if now.saturating_sub(last_assistant.timestamp) > SESSION_ABANDON_WINDOW_MS {
+            return;
+        }
+
+        let last_user_after_assistant = thread
+            .messages
+            .iter()
+            .rev()
+            .find(|message| message.role == MessageRole::User)
+            .is_some_and(|message| message.timestamp > last_assistant.timestamp);
+        if last_user_after_assistant {
+            return;
+        }
+
+        let recent_existing = self
+            .history
+            .list_implicit_signals(&thread.id, 10)
+            .await
+            .unwrap_or_default();
+        if recent_existing
+            .iter()
+            .any(|signal| signal.signal_type == "session_abandon")
+        {
+            return;
+        }
+
+        if let Err(error) = self
+            .record_session_abandon_feedback(
+                &thread.id,
+                last_assistant.content.trim(),
+                last_assistant.timestamp,
+                now,
+            )
+            .await
+        {
+            tracing::warn!(
+                thread_id = %thread.id,
+                error = %error,
+                "failed to record session abandonment feedback on thread delete"
+            );
+        }
     }
 }
 

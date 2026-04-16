@@ -97,6 +97,13 @@ const AGENT_HTTP_READ_TIMEOUT: Duration = Duration::from_secs(125);
 // AgentEngine
 // ---------------------------------------------------------------------------
 
+#[derive(Debug, Clone)]
+pub struct CritiqueApprovalContinuation {
+    pub tool_call: ToolCall,
+    pub thread_id: String,
+    pub agent_data_dir: PathBuf,
+}
+
 pub struct AgentEngine {
     pub started_at_ms: u64,
     pub config: Arc<RwLock<AgentConfig>>,
@@ -170,6 +177,8 @@ pub struct AgentEngine {
         Mutex<HashMap<String, crate::agent::stalled_turns::StalledTurnCandidate>>,
     pub(super) active_operator_sessions: RwLock<HashMap<String, u64>>,
     pub(super) pending_operator_approvals: RwLock<HashMap<String, PendingApprovalObservation>>,
+    pub(super) critique_approval_continuations:
+        Mutex<HashMap<String, CritiqueApprovalContinuation>>,
     pub(super) policy_escalation_session_grants: RwLock<HashSet<String>>,
     pub(super) task_approval_rules: RwLock<Vec<amux_protocol::TaskApprovalRule>>,
     pub(super) pending_operator_questions: Mutex<HashMap<String, PendingOperatorQuestionState>>,
@@ -364,6 +373,7 @@ impl AgentEngine {
             stalled_turn_candidates: Mutex::new(HashMap::new()),
             active_operator_sessions: RwLock::new(HashMap::new()),
             pending_operator_approvals: RwLock::new(HashMap::new()),
+            critique_approval_continuations: Mutex::new(HashMap::new()),
             policy_escalation_session_grants: RwLock::new(HashSet::new()),
             task_approval_rules: RwLock::new(Vec::new()),
             pending_operator_questions: Mutex::new(HashMap::new()),

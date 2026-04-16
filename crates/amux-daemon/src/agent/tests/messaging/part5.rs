@@ -1427,3 +1427,39 @@ async fn upserting_builtin_alias_stores_canonical_agent_name() {
     assert_eq!(participant.agent_id, "swarog");
     assert_eq!(participant.agent_name, "Svarog");
 }
+
+#[tokio::test]
+async fn upserting_veles_alias_stores_weles_canonical_name() {
+    let root = tempdir().expect("tempdir");
+    let manager = SessionManager::new_test(root.path()).await;
+    let engine = AgentEngine::new_test(manager, AgentConfig::default(), root.path()).await;
+    let thread_id = "thread-veles-alias-canonical";
+
+    engine.threads.write().await.insert(
+        thread_id.to_string(),
+        AgentThread {
+            id: thread_id.to_string(),
+            agent_name: Some(crate::agent::agent_identity::MAIN_AGENT_NAME.to_string()),
+            title: "Canonical veles alias".to_string(),
+            messages: vec![AgentMessage::user("hello", 1)],
+            pinned: false,
+            upstream_thread_id: None,
+            upstream_transport: None,
+            upstream_provider: None,
+            upstream_model: None,
+            upstream_assistant_id: None,
+            total_input_tokens: 0,
+            total_output_tokens: 0,
+            created_at: 1,
+            updated_at: 1,
+        },
+    );
+
+    let participant = engine
+        .upsert_thread_participant(thread_id, "veles", "watch for regressions")
+        .await
+        .expect("veles alias should resolve");
+
+    assert_eq!(participant.agent_id, "weles");
+    assert_eq!(participant.agent_name, "Weles");
+}

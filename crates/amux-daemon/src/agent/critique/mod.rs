@@ -36,6 +36,30 @@ fn dedupe_argument_points(mut points: Vec<ArgumentPoint>) -> Vec<ArgumentPoint> 
     points
 }
 
+pub(crate) fn operator_report_summary(session: &CritiqueSession) -> String {
+    let decision = session
+        .resolution
+        .as_ref()
+        .map(|resolution| resolution.decision.as_str())
+        .unwrap_or(match session.status {
+            SessionStatus::InProgress => "in_progress",
+            SessionStatus::Resolved => "resolved",
+            SessionStatus::Deferred => "deferred",
+        });
+    let rationale = session
+        .resolution
+        .as_ref()
+        .map(|resolution| resolution.synthesis.as_str())
+        .unwrap_or(session.proposed_action_summary.as_str());
+    crate::agent::summarize_text(
+        &format!(
+            "Critiqued {} -> {}: {}",
+            session.tool_name, decision, rationale
+        ),
+        220,
+    )
+}
+
 fn critique_fallback_argument_points(
     tool_name: &str,
     preferred_fallback_targets: &[String],
@@ -562,6 +586,7 @@ impl AgentEngine {
             "action_id": session.action_id,
             "tool_name": session.tool_name,
             "proposed_action_summary": session.proposed_action_summary,
+            "report_summary": operator_report_summary(&session),
             "advocate_argument": session.advocate_argument,
             "critic_argument": session.critic_argument,
             "resolution": session.resolution,

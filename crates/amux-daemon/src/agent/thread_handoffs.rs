@@ -206,8 +206,13 @@ fn resolve_thread_handoff_agent(alias: &str) -> Option<(String, String)> {
             SWIETOWIT_AGENT_ID.to_string(),
             SWIETOWIT_AGENT_NAME.to_string(),
         )),
+        PERUN_AGENT_ID => Some((PERUN_AGENT_ID.to_string(), PERUN_AGENT_NAME.to_string())),
+        MOKOSH_AGENT_ID => Some((MOKOSH_AGENT_ID.to_string(), MOKOSH_AGENT_NAME.to_string())),
+        DAZHBOG_AGENT_ID => Some((DAZHBOG_AGENT_ID.to_string(), DAZHBOG_AGENT_NAME.to_string())),
         ROD_AGENT_ID => Some((ROD_AGENT_ID.to_string(), ROD_AGENT_NAME.to_string())),
-        WELES_AGENT_ID => Some((WELES_AGENT_ID.to_string(), WELES_AGENT_NAME.to_string())),
+        WELES_AGENT_ID | "veles" => {
+            Some((WELES_AGENT_ID.to_string(), WELES_AGENT_NAME.to_string()))
+        }
         _ => None,
     };
     builtin

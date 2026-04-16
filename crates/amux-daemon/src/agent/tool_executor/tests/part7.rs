@@ -365,6 +365,114 @@ async fn read_memory_skips_fresh_injected_base_markdown_by_default() {
 }
 
 #[tokio::test]
+async fn read_memory_includes_structural_graph_lookup_results() {
+    let root = tempdir().expect("tempdir");
+    let manager = SessionManager::new_test(root.path()).await;
+    let engine = AgentEngine::new_test(manager.clone(), AgentConfig::default(), root.path()).await;
+    let (event_tx, _) = broadcast::channel(8);
+    let thread_id = "thread-read-memory-structural-graph";
+    let agent_data_dir = root.path().join("agent");
+
+    engine
+        .history
+        .create_thread(&amux_protocol::AgentDbThread {
+            id: thread_id.to_string(),
+            workspace_id: None,
+            surface_id: None,
+            pane_id: None,
+            agent_name: Some(crate::agent::agent_identity::MAIN_AGENT_NAME.to_string()),
+            title: "Structural graph lookup thread".to_string(),
+            created_at: 1,
+            updated_at: 1,
+            message_count: 0,
+            total_tokens: 0,
+            last_preview: String::new(),
+            metadata_json: None,
+        })
+        .await
+        .expect("seed thread row");
+    engine.threads.write().await.insert(
+        thread_id.to_string(),
+        make_thread(
+            thread_id,
+            Some(crate::agent::agent_identity::MAIN_AGENT_NAME),
+            "Structural graph lookup thread",
+            false,
+            1,
+            1,
+            vec![crate::agent::types::AgentMessage::user("show structural graph", 1)],
+        ),
+    );
+
+    engine
+        .thread_structural_memories
+        .write()
+        .await
+        .insert(
+            thread_id.to_string(),
+            crate::agent::context::structural_memory::ThreadStructuralMemory {
+                workspace_seed_scan_complete: true,
+                language_hints: vec!["rust".to_string()],
+                workspace_seeds: vec![crate::agent::context::structural_memory::WorkspaceSeed {
+                    node_id: "node:file:Cargo.toml".to_string(),
+                    relative_path: "Cargo.toml".to_string(),
+                    kind: "cargo_manifest".to_string(),
+                }],
+                observed_files: vec![crate::agent::context::structural_memory::ObservedFileNode {
+                    node_id: "node:file:src/lib.rs".to_string(),
+                    relative_path: "src/lib.rs".to_string(),
+                }],
+                edges: vec![crate::agent::context::structural_memory::StructuralEdge {
+                    from: "node:file:src/lib.rs".to_string(),
+                    to: "node:package:cargo:demo".to_string(),
+                    kind: "file_in_package".to_string(),
+                }],
+            },
+        );
+
+    let tool_call = ToolCall::with_default_weles_review(
+        "tool-read-memory-structural-graph".to_string(),
+        ToolFunction {
+            name: "read_memory".to_string(),
+            arguments: serde_json::json!({
+                "include_thread_structural_memory": true,
+            })
+            .to_string(),
+        },
+    );
+
+    let result = execute_tool(
+        &tool_call,
+        &engine,
+        thread_id,
+        None,
+        &manager,
+        None,
+        &event_tx,
+        &agent_data_dir,
+        &engine.http_client,
+        None,
+    )
+    .await;
+
+    assert!(!result.is_error, "read_memory should succeed: {}", result.content);
+    let payload: serde_json::Value =
+        serde_json::from_str(&result.content).expect("read_memory should return JSON");
+    let graph_lookup = payload
+        .get("results")
+        .and_then(|value| value.get("thread_structural_memory"))
+        .and_then(|value| value.get("graph_lookup"))
+        .and_then(|value| value.as_array())
+        .expect("thread structural memory should expose graph_lookup");
+    assert!(!graph_lookup.is_empty(), "graph_lookup should not be empty");
+    assert!(graph_lookup.iter().any(|item| {
+        item.get("node_id").and_then(|value| value.as_str()) == Some("node:package:cargo:demo")
+            && item.get("relation_kind").and_then(|value| value.as_str())
+                == Some("file_in_package")
+    }));
+}
+
+#[tokio::test]
 async fn mcp_read_memory_uses_explicit_thread_id_for_injection_state() {
     let root = tempdir().expect("tempdir");
     let manager = SessionManager::new_test(root.path()).await;
@@ -1510,6 +1618,13 @@ async fn critique_preflight_blocks_risky_bash_command_when_enabled() {
         "resolved"
     };
     assert_eq!(payload["status"].as_str(), Some(expected_status));
+    let report_summary = payload["report_summary"]
+        .as_str()
+        .expect("critique payload should surface operator-facing report summary");
+    assert!(review
+        .reasons
+        .iter()
+        .any(|reason| reason == &format!("critique_report:{report_summary}")));
 }
 
 #[tokio::test]
@@ -4126,11 +4241,15 @@ fn annotate_review_with_critique_preserves_non_proceed_decisions() {
         Some("critique_session_123"),
         Some("proceed_with_modifications"),
         &[],
+        Some("Critiqued bash_command -> proceed_with_modifications: keep the action, but harden it."),
     );
 
     assert!(review.weles_reviewed);
     assert!(review.reasons.iter().any(|reason| {
         reason == "critique_preflight:critique_session_123:proceed_with_modifications"
+    }));
+    assert!(review.reasons.iter().any(|reason| {
+        reason == "critique_report:Critiqued bash_command -> proceed_with_modifications: keep the action, but harden it."
     }));
     assert_eq!(review.audit_id.as_deref(), Some("critique_session_123"));
 }
@@ -4855,6 +4974,172 @@ async fn critique_preflight_promotes_fallback_aligned_guidance_from_operator_his
         resolution.modifications);
 }
 
+#[tokio::test]
+async fn critique_fallback_apply_patch_rewrites_shell_execution_when_patch_payload_is_already_present() {
+    let root = tempdir().expect("tempdir should succeed");
+    let manager = SessionManager::new_test(root.path()).await;
+    let mut config = AgentConfig::default();
+    config.critique.enabled = true;
+    config.critique.mode = crate::agent::types::CritiqueMode::Deterministic;
+    config.critique.guard_suspicious_tool_calls_only = false;
+    config.extra.insert(
+        "test_force_critique_decision".to_string(),
+        serde_json::Value::String("proceed_with_modifications".to_string()),
+    );
+    config.extra.insert(
+        "test_force_critique_modifications".to_string(),
+        serde_json::json!([
+            "Prefer apply_patch over brittle shell rewrites for this change."
+        ]),
+    );
+
+    let engine = AgentEngine::new_test(manager.clone(), config, root.path()).await;
+    {
+        let mut model = engine.operator_model.write().await;
+        model.risk_fingerprint.risk_tolerance =
+            crate::agent::operator_model::RiskTolerance::Aggressive;
+        model.implicit_feedback.top_tool_fallbacks =
+            vec!["bash_command -> apply_patch".to_string()];
+    }
+    let (event_tx, _) = broadcast::channel(8);
+
+    let target = root.path().join("patch-target.txt");
+    std::fs::write(&target, "alpha\nold value\nomega\n")
+        .expect("write target file should succeed");
+    let patch = format!(
+        "*** Begin Patch\n*** Update File: {}\n@@\n-old value\n+new value\n*** End Patch\n",
+        target.display()
+    );
+
+    let tool_call = ToolCall::with_default_weles_review(
+        "tool-critique-fallback-apply-patch".to_string(),
+        ToolFunction {
+            name: "bash_command".to_string(),
+            arguments: serde_json::json!({
+                "command": "exit 23",
+                "input": patch
+            })
+            .to_string(),
+        },
+    );
+
+    let result = execute_tool(
+        &tool_call,
+        &engine,
+        "thread-critique-fallback-apply-patch",
+        None,
+        &manager,
+        None,
+        &event_tx,
+        root.path(),
+        &engine.http_client,
+        None,
+    )
+    .await;
+
+    assert!(
+        !result.is_error,
+        "fallback-aligned critique rewrite should substitute safe apply_patch execution: {}",
+        result.content
+    );
+    let content = std::fs::read_to_string(&target).expect("read patched file");
+    assert!(content.contains("new value"));
+    assert!(!content.contains("old value"));
+    let review = result
+        .weles_review
+        .expect("successful fallback patch rewrite should preserve review metadata");
+    assert!(review
+        .reasons
+        .iter()
+        .any(|reason| reason.starts_with("critique_preflight:")));
+    assert!(review
+        .reasons
+        .iter()
+        .any(|reason| reason == "critique_applied:fallback:rewrite_to_apply_patch"));
+}
+
+#[tokio::test]
+async fn critique_fallback_replace_in_file_rewrites_shell_execution_when_args_are_trivially_mappable() {
+    let root = tempdir().expect("tempdir should succeed");
+    let manager = SessionManager::new_test(root.path()).await;
+    let mut config = AgentConfig::default();
+    config.critique.enabled = true;
+    config.critique.mode = crate::agent::types::CritiqueMode::Deterministic;
+    config.critique.guard_suspicious_tool_calls_only = false;
+    config.extra.insert(
+        "test_force_critique_decision".to_string(),
+        serde_json::Value::String("proceed_with_modifications".to_string()),
+    );
+    config.extra.insert(
+        "test_force_critique_modifications".to_string(),
+        serde_json::json!([
+            "Prefer replace_in_file over ad-hoc shell rewrites when a narrow textual edit is enough."
+        ]),
+    );
+
+    let engine = AgentEngine::new_test(manager.clone(), config, root.path()).await;
+    {
+        let mut model = engine.operator_model.write().await;
+        model.risk_fingerprint.risk_tolerance =
+            crate::agent::operator_model::RiskTolerance::Aggressive;
+        model.implicit_feedback.top_tool_fallbacks =
+            vec!["bash_command -> replace_in_file".to_string()];
+    }
+    let (event_tx, _) = broadcast::channel(8);
+
+    let target = root.path().join("rewrite-target.txt");
+    std::fs::write(&target, "alpha\nold value\nomega\n")
+        .expect("write target file should succeed");
+
+    let tool_call = ToolCall::with_default_weles_review(
+        "tool-critique-fallback-replace-in-file".to_string(),
+        ToolFunction {
+            name: "bash_command".to_string(),
+            arguments: serde_json::json!({
+                "command": "exit 17",
+                "path": target,
+                "old_text": "old value",
+                "new_text": "new value"
+            })
+            .to_string(),
+        },
+    );
+
+    let result = execute_tool(
+        &tool_call,
+        &engine,
+        "thread-critique-fallback-replace-in-file",
+        None,
+        &manager,
+        None,
+        &event_tx,
+        root.path(),
+        &engine.http_client,
+        None,
+    )
+    .await;
+
+    assert!(
+        !result.is_error,
+        "fallback-aligned critique rewrite should substitute safe replace_in_file execution: {}",
+        result.content
+    );
+    let content = std::fs::read_to_string(&target).expect("read rewritten file");
+    assert!(content.contains("new value"));
+    assert!(!content.contains("old value"));
+    let review = result
+        .weles_review
+        .expect("successful fallback rewrite should preserve review metadata");
+    assert!(review
+        .reasons
+        .iter()
+        .any(|reason| reason.starts_with("critique_preflight:")));
+    assert!(review
+        .reasons
+        .iter()
+        .any(|reason| reason == "critique_applied:fallback:rewrite_to_replace_in_file"));
+}
+
 #[test]
 fn annotate_review_with_critique_records_applied_adjustments() {
     let mut review = crate::agent::types::WelesReviewMeta {
@@ -4870,6 +5155,7 @@ fn annotate_review_with_critique_records_applied_adjustments() {
         Some("critique_session_456"),
         Some("proceed_with_modifications"),
         &["shell:enable_sandbox".to_string(), "shell:disable_network".to_string()],
+        Some("Critiqued bash_command -> proceed_with_modifications: disable network and enable sandbox."),
     );
 
     assert!(review.reasons.iter().any(|reason| {
@@ -4877,6 +5163,9 @@ fn annotate_review_with_critique_records_applied_adjustments() {
     }));
     assert!(review.reasons.iter().any(|reason| {
         reason == "critique_applied:shell:disable_network"
+    }));
+    assert!(review.reasons.iter().any(|reason| {
+        reason == "critique_report:Critiqued bash_command -> proceed_with_modifications: disable network and enable sandbox."
     }));
 }
 
@@ -4937,6 +5226,518 @@ fn apply_critique_modifications_strips_explicit_messaging_targets_and_broadcasts
     assert!(changes.iter().any(|item| item == "messaging:strip_explicit_user"));
     assert!(changes.iter().any(|item| item == "messaging:strip_explicit_reply"));
     assert!(changes.iter().any(|item| item == "messaging:strip_broadcast_mentions"));
+}
+
+#[tokio::test]
+async fn approving_critique_confirmation_resumes_switch_model_without_retriggering_critique() {
+    let root = tempdir().expect("tempdir should succeed");
+    let manager = SessionManager::new_test(root.path()).await;
+    let mut config = AgentConfig::default();
+    config.provider = amux_shared::providers::PROVIDER_ID_OPENAI.to_string();
+    config.model = "gpt-5.4-mini".to_string();
+    config.api_key = "test-key".to_string();
+    config.critique.enabled = true;
+    config.critique.mode = crate::agent::types::CritiqueMode::Deterministic;
+    config.extra.insert(
+        "test_force_critique_decision".to_string(),
+        serde_json::Value::String("proceed_with_modifications".to_string()),
+    );
+    let engine = AgentEngine::new_test(manager.clone(), config, root.path()).await;
+    let (event_tx, _) = broadcast::channel(8);
+
+    let tool_call = ToolCall::with_default_weles_review(
+        "tool-switch-model-critique-resume".to_string(),
+        ToolFunction {
+            name: "switch_model".to_string(),
+            arguments: serde_json::json!({
+                "agent": "svarog",
+                "provider": amux_shared::providers::PROVIDER_ID_OPENAI,
+                "model": "gpt-5.4"
+            })
+            .to_string(),
+        },
+    );
+
+    let first_result = crate::agent::agent_identity::run_with_agent_scope(
+        crate::agent::agent_identity::MAIN_AGENT_ID.to_string(),
+        async {
+            {
+                let mut model = engine.operator_model.write().await;
+                model.risk_fingerprint.risk_tolerance = crate::agent::operator_model::RiskTolerance::Moderate;
+                model.operator_satisfaction.label = "strained".to_string();
+                model.operator_satisfaction.score = 0.21;
+            }
+            execute_tool(
+                &tool_call,
+                &engine,
+                "thread-switch-model-critique-resume",
+                None,
+                &manager,
+                None,
+                &event_tx,
+                root.path(),
+                &engine.http_client,
+                None,
+            )
+            .await
+        },
+    )
+    .await;
+
+    assert!(!first_result.is_error, "first pass should pause for approval, not hard fail");
+    let pending = first_result
+        .pending_approval
+        .clone()
+        .expect("critique confirmation should produce pending approval");
+
+    let resumed = engine
+        .resume_critique_approval_continuation(
+            &pending.approval_id,
+            amux_protocol::ApprovalDecision::ApproveOnce,
+            &manager,
+            &event_tx,
+            root.path(),
+            &engine.http_client,
+        )
+        .await
+        .expect("approved critique continuation should resume");
+
+    assert!(!resumed.is_error, "resumed execution should succeed: {}", resumed.content);
+    assert!(resumed.pending_approval.is_none(), "resume should not re-trigger critique approval");
+    let review = resumed
+        .weles_review
+        .expect("resumed critique execution should expose governance metadata");
+    assert!(review.weles_reviewed);
+    assert_eq!(review.verdict, crate::agent::types::WelesVerdict::Allow);
+    assert!(review
+        .reasons
+        .iter()
+        .any(|reason| reason == "operator approved critique confirmation replay"));
+
+    let stored = engine.get_config().await;
+    assert_eq!(stored.provider, amux_shared::providers::PROVIDER_ID_OPENAI);
+    assert_eq!(stored.model, "gpt-5.4");
+}
+
+#[tokio::test]
+async fn critique_confirmation_marker_returns_pending_approval_for_plugin_api_call() {
+    let root = tempdir().expect("tempdir should succeed");
+    let manager = SessionManager::new_test(root.path()).await;
+    let mut config = AgentConfig::default();
+    config.critique.enabled = true;
+    config.critique.mode = crate::agent::types::CritiqueMode::Deterministic;
+    config.extra.insert(
+        "test_force_critique_decision".to_string(),
+        serde_json::Value::String("proceed_with_modifications".to_string()),
+    );
+    let engine = AgentEngine::new_test(manager.clone(), config, root.path()).await;
+    let (event_tx, _) = broadcast::channel(8);
+
+    let tool_call = ToolCall::with_default_weles_review(
+        "tool-plugin-api-critique-pending-approval".to_string(),
+        ToolFunction {
+            name: "plugin_api_call".to_string(),
+            arguments: serde_json::json!({
+                "plugin_name": "ops_plugin",
+                "endpoint_name": "reconfigure_runtime"
+            })
+            .to_string(),
+        },
+    );
+
+    {
+        let mut model = engine.operator_model.write().await;
+        model.risk_fingerprint.risk_tolerance = crate::agent::operator_model::RiskTolerance::Moderate;
+        model.operator_satisfaction.label = "strained".to_string();
+        model.operator_satisfaction.score = 0.21;
+    }
+    let result = execute_tool(
+        &tool_call,
+        &engine,
+        "thread-plugin-api-critique-pending-approval",
+        None,
+        &manager,
+        None,
+        &event_tx,
+        root.path(),
+        &engine.http_client,
+        None,
+    )
+    .await;
+
+    assert!(!result.is_error, "critique confirmation should return a pending approval");
+    let pending = result
+        .pending_approval
+        .expect("plugin_api_call should surface a pending approval");
+    assert!(pending.approval_id.starts_with("critique-confirmation-"));
+    assert!(pending.command.contains("plugin_api_call"));
+    assert!(result.content.contains("requires operator approval before execution"));
+}
+
+#[tokio::test]
+async fn critique_confirmation_marker_returns_pending_approval_for_synthesize_tool() {
+    let root = tempdir().expect("tempdir should succeed");
+    let manager = SessionManager::new_test(root.path()).await;
+    let mut config = AgentConfig::default();
+    config.critique.enabled = true;
+    config.critique.mode = crate::agent::types::CritiqueMode::Deterministic;
+    config.extra.insert(
+        "test_force_critique_decision".to_string(),
+        serde_json::Value::String("proceed_with_modifications".to_string()),
+    );
+    let engine = AgentEngine::new_test(manager.clone(), config, root.path()).await;
+    let (event_tx, _) = broadcast::channel(8);
+
+    let tool_call = ToolCall::with_default_weles_review(
+        "tool-synthesize-tool-critique-pending-approval".to_string(),
+        ToolFunction {
+            name: "synthesize_tool".to_string(),
+            arguments: serde_json::json!({
+                "kind": "cli",
+                "target": "gh --help",
+                "activate": true
+            })
+            .to_string(),
+        },
+    );
+
+    {
+        let mut model = engine.operator_model.write().await;
+        model.risk_fingerprint.risk_tolerance = crate::agent::operator_model::RiskTolerance::Moderate;
+        model.operator_satisfaction.label = "strained".to_string();
+        model.operator_satisfaction.score = 0.21;
+    }
+    let result = execute_tool(
+        &tool_call,
+        &engine,
+        "thread-synthesize-tool-critique-pending-approval",
+        None,
+        &manager,
+        None,
+        &event_tx,
+        root.path(),
+        &engine.http_client,
+        None,
+    )
+    .await;
+
+    assert!(!result.is_error, "critique confirmation should return a pending approval");
+    let pending = result
+        .pending_approval
+        .expect("synthesize_tool should surface a pending approval");
+    assert!(pending.approval_id.starts_with("critique-confirmation-"));
+    assert!(pending.command.contains("synthesize_tool"));
+    assert!(result.content.contains("requires operator approval before execution"));
+}
+
+#[tokio::test]
+async fn critique_confirmation_marker_returns_pending_approval_for_switch_model() {
+    let root = tempdir().expect("tempdir should succeed");
+    let manager = SessionManager::new_test(root.path()).await;
+    let mut config = AgentConfig::default();
+    config.critique.enabled = true;
+    config.critique.mode = crate::agent::types::CritiqueMode::Deterministic;
+    config.extra.insert(
+        "test_force_critique_decision".to_string(),
+        serde_json::Value::String("proceed_with_modifications".to_string()),
+    );
+    let engine = AgentEngine::new_test(manager.clone(), config, root.path()).await;
+    let (event_tx, _) = broadcast::channel(8);
+
+    let tool_call = ToolCall::with_default_weles_review(
+        "tool-switch-model-critique-pending-approval".to_string(),
+        ToolFunction {
+            name: "switch_model".to_string(),
+            arguments: serde_json::json!({
+                "agent": "svarog",
+                "provider": amux_shared::providers::PROVIDER_ID_OPENAI,
+                "model": "gpt-5.4"
+            })
+            .to_string(),
+        },
+    );
+
+    let result = crate::agent::agent_identity::run_with_agent_scope(
+        crate::agent::agent_identity::MAIN_AGENT_ID.to_string(),
+        async {
+            {
+                let mut model = engine.operator_model.write().await;
+                model.risk_fingerprint.risk_tolerance = crate::agent::operator_model::RiskTolerance::Moderate;
+                model.operator_satisfaction.label = "strained".to_string();
+                model.operator_satisfaction.score = 0.21;
+            }
+            execute_tool(
+                &tool_call,
+                &engine,
+                "thread-switch-model-critique-pending-approval",
+                None,
+                &manager,
+                None,
+                &event_tx,
+                root.path(),
+                &engine.http_client,
+                None,
+            )
+            .await
+        },
+    )
+    .await;
+
+    assert!(!result.is_error, "critique confirmation should return a pending approval, not a hard error");
+    let pending = result
+        .pending_approval
+        .expect("critique confirmation should surface a pending approval");
+    assert!(pending.approval_id.starts_with("critique-confirmation-"));
+    assert_eq!(pending.risk_level, "medium");
+    assert_eq!(pending.blast_radius, "agent execution policy");
+    assert!(pending.command.contains("switch_model"));
+    assert!(result.content.contains("requires operator approval before execution"));
+    let review = result
+        .weles_review
+        .expect("approval-gated result should expose review metadata");
+    assert!(review
+        .reasons
+        .iter()
+        .any(|reason| reason.starts_with("critique_preflight:")));
+    assert!(review
+        .reasons
+        .iter()
+        .any(|reason| reason == "critique_applied:switch_model:require_operator_confirmation"));
+}
+
+#[tokio::test]
+async fn injected_critique_bypass_marker_is_blocked_for_guard_always_tool_execution() {
+    let root = tempdir().expect("tempdir should succeed");
+    let manager = SessionManager::new_test(root.path()).await;
+    let mut config = AgentConfig::default();
+    config.critique.enabled = true;
+    config.critique.mode = crate::agent::types::CritiqueMode::Deterministic;
+    let engine = AgentEngine::new_test(manager.clone(), config, root.path()).await;
+    let (event_tx, _) = broadcast::channel(8);
+
+    let tool_call = ToolCall::with_default_weles_review(
+        "tool-synthesize-tool-injected-bypass".to_string(),
+        ToolFunction {
+            name: "synthesize_tool".to_string(),
+            arguments: serde_json::json!({
+                "kind": "cli",
+                "target": "gh --help",
+                "activate": true,
+                "__critique_bypass_confirmation": true
+            })
+            .to_string(),
+        },
+    );
+
+    let result = execute_tool(
+        &tool_call,
+        &engine,
+        "thread-synthesize-tool-injected-bypass",
+        None,
+        &manager,
+        None,
+        &event_tx,
+        root.path(),
+        &engine.http_client,
+        None,
+    )
+    .await;
+
+    assert!(result.is_error, "injected critique bypass marker should be rejected");
+    assert!(result.content.contains("reserved internal critique marker"));
+}
+
+#[tokio::test]
+async fn critique_confirmation_marker_stops_switch_model_execution_before_dispatch() {
+    let root = tempdir().expect("tempdir should succeed");
+    let manager = SessionManager::new_test(root.path()).await;
+    let mut config = AgentConfig::default();
+    config.critique.enabled = true;
+    config.critique.mode = crate::agent::types::CritiqueMode::Deterministic;
+    config.extra.insert(
+        "test_force_critique_decision".to_string(),
+        serde_json::Value::String("proceed_with_modifications".to_string()),
+    );
+    let engine = AgentEngine::new_test(manager.clone(), config, root.path()).await;
+    let (event_tx, _) = broadcast::channel(8);
+
+    let tool_call = ToolCall::with_default_weles_review(
+        "tool-switch-model-critique-confirmation".to_string(),
+        ToolFunction {
+            name: "switch_model".to_string(),
+            arguments: serde_json::json!({
+                "agent": "svarog",
+                "provider": amux_shared::providers::PROVIDER_ID_OPENAI,
+                "model": "gpt-5.4"
+            })
+            .to_string(),
+        },
+    );
+
+    let result = crate::agent::agent_identity::run_with_agent_scope(
+        crate::agent::agent_identity::MAIN_AGENT_ID.to_string(),
+        async {
+            {
+                let mut model = engine.operator_model.write().await;
+                model.risk_fingerprint.risk_tolerance = crate::agent::operator_model::RiskTolerance::Moderate;
+                model.operator_satisfaction.label = "strained".to_string();
+                model.operator_satisfaction.score = 0.21;
+            }
+            execute_tool(
+                &tool_call,
+                &engine,
+                "thread-switch-model-critique-confirmation",
+                None,
+                &manager,
+                None,
+                &event_tx,
+                root.path(),
+                &engine.http_client,
+                None,
+            )
+            .await
+        },
+    )
+    .await;
+
+    assert!(!result.is_error, "critique confirmation marker should stop execution via pending approval, not a hard error");
+    let pending = result
+        .pending_approval
+        .expect("critique confirmation marker should surface a pending approval");
+    assert!(pending.approval_id.starts_with("critique-confirmation-"));
+    assert!(result.content.contains("requires operator approval before execution"));
+    let review = result
+        .weles_review
+        .expect("critique block should expose review metadata");
+    assert!(review
+        .reasons
+        .iter()
+        .any(|reason| reason.starts_with("critique_preflight:")));
+    assert!(review
+        .reasons
+        .iter()
+        .any(|reason| reason == "critique_applied:switch_model:require_operator_confirmation"));
+}
+
+#[test]
+fn apply_critique_modifications_requires_confirmation_for_synthesize_tool() {
+    let args = serde_json::json!({
+        "kind": "cli",
+        "target": "gh --help",
+        "activate": true
+    });
+
+    let (adjusted, changes) = super::apply_critique_modifications(
+        "synthesize_tool",
+        &args,
+        Some("proceed_with_modifications"),
+        &["tool synthesis can rewrite runtime tool capability policy".to_string()],
+        &["Require explicit operator confirmation before allowing tool synthesis for gh --help because synthesizing runtime tools can rewrite runtime tool capability policy.".to_string()],
+        &[],
+        None,
+    );
+
+    assert_eq!(
+        adjusted["__critique_requires_operator_confirmation"].as_bool(),
+        Some(true)
+    );
+    assert_eq!(
+        adjusted["__critique_confirmation_reason"].as_str(),
+        Some("synthesize_tool")
+    );
+    assert!(changes
+        .iter()
+        .any(|item| item == "synthesize_tool:require_operator_confirmation"));
+}
+
+#[test]
+fn apply_critique_modifications_requires_confirmation_for_switch_model() {
+    let args = serde_json::json!({
+        "agent": "svarog",
+        "provider": "openai",
+        "model": "gpt-5.4"
+    });
+
+    let (adjusted, changes) = super::apply_critique_modifications(
+        "switch_model",
+        &args,
+        Some("proceed_with_modifications"),
+        &["provider or model reconfiguration mutates persisted agent execution policy"
+            .to_string()],
+        &["Require explicit operator confirmation before changing the provider or model for Svarog because it rewrites persisted agent execution policy.".to_string()],
+        &[],
+        None,
+    );
+
+    assert_eq!(
+        adjusted["__critique_requires_operator_confirmation"].as_bool(),
+        Some(true)
+    );
+    assert_eq!(
+        adjusted["__critique_confirmation_reason"].as_str(),
+        Some("switch_model")
+    );
+    assert!(changes
+        .iter()
+        .any(|item| item == "switch_model:require_operator_confirmation"));
+}
+
+#[test]
+fn apply_critique_modifications_requires_confirmation_for_plugin_api_call() {
+    let args = serde_json::json!({
+        "plugin_name": "ops_plugin",
+        "endpoint_name": "reconfigure_runtime"
+    });
+
+    let (adjusted, changes) = super::apply_critique_modifications(
+        "plugin_api_call",
+        &args,
+        Some("proceed_with_modifications"),
+        &["plugin API invocation can mutate plugin execution policy or external side effects"
+            .to_string()],
+        &["Require explicit operator confirmation before invoking plugin endpoint reconfigure_runtime because plugin API calls can rewrite plugin execution policy or trigger external side effects.".to_string()],
+        &[],
+        None,
+    );
+
+    assert_eq!(
+        adjusted["__critique_requires_operator_confirmation"].as_bool(),
+        Some(true)
+    );
+    assert_eq!(
+        adjusted["__critique_confirmation_reason"].as_str(),
+        Some("plugin_api_call")
+    );
+    assert!(changes
+        .iter()
+        .any(|item| item == "plugin_api_call:require_operator_confirmation"));
+}
+
+#[test]
+fn apply_critique_modifications_narrows_sensitive_file_paths_from_prose_only_and_drops_anchors() {
+    let args = serde_json::json!({
+        "path": "/tmp/demo/.env",
+        "cwd": "/tmp/demo",
+        "session": "session-123",
+        "content": "TOKEN=***REDACTED***"
+    });
+
+    let (adjusted, changes) = super::apply_critique_modifications(
+        "write_file",
+        &args,
+        Some("proceed_with_modifications"),
+        &[],
+        &["Narrow the sensitive file path to a minimal basename before writing.".to_string()],
+        &[],
+        None,
+    );
+
+    assert_eq!(adjusted["path"].as_str(), Some(".env"));
+    assert!(adjusted.get("cwd").is_none());
+    assert!(adjusted.get("session").is_none());
+    assert!(changes.iter().any(|item| item == "file:narrow_path:path"));
+    assert!(changes.iter().any(|item| item == "file:drop_cwd_anchor"));
+    assert!(changes.iter().any(|item| item == "file:drop_session_anchor"));
 }
 
 #[test]
@@ -5294,6 +6095,26 @@ async fn critique_modifications_schedule_enqueue_task_for_operator_window_end_to
         .reasons
         .iter()
         .any(|reason| reason == "critique_applied:temporal:schedule_for_operator_window"));
+    let critique_reason = review
+        .reasons
+        .iter()
+        .find(|reason| reason.starts_with("critique_preflight:"))
+        .cloned()
+        .expect("successful critique rewrite should expose critique session id");
+    let mut parts = critique_reason.split(':');
+    let _prefix = parts.next();
+    let session_id = parts.next().expect("critique reason should include session id");
+    let payload = engine
+        .get_critique_session_payload(session_id)
+        .await
+        .expect("critique session should persist for rewritten success path");
+    let report_summary = payload["report_summary"]
+        .as_str()
+        .expect("persisted critique payload should include report summary");
+    assert!(review
+        .reasons
+        .iter()
+        .any(|reason| reason == &format!("critique_report:{report_summary}")));
 }
 
 #[tokio::test]
@@ -5651,6 +6472,92 @@ fn apply_critique_modifications_narrows_sensitive_apply_patch_paths() {
 }
 
 #[tokio::test]
+async fn critique_modifications_narrow_sensitive_write_file_path_from_prose_only_drops_cwd_anchor_end_to_end() {
+    let _cwd_lock = current_dir_test_lock().lock().expect("cwd lock");
+    let original_cwd = std::env::current_dir().expect("current dir");
+
+    let root = tempdir().expect("tempdir should succeed");
+    let manager = SessionManager::new_test(root.path()).await;
+    let mut config = AgentConfig::default();
+    config.critique.enabled = true;
+    config.critique.mode = crate::agent::types::CritiqueMode::Deterministic;
+    config.critique.guard_suspicious_tool_calls_only = false;
+    config.extra.insert(
+        "test_force_critique_decision".to_string(),
+        serde_json::Value::String("proceed_with_modifications".to_string()),
+    );
+    config.extra.insert(
+        "test_force_critique_modifications".to_string(),
+        serde_json::json!([
+            "Narrow the sensitive file path to a minimal basename before writing."
+        ]),
+    );
+
+    let workspace = root.path().join("workspace");
+    std::fs::create_dir_all(&workspace).expect("create workspace");
+    std::env::set_current_dir(&workspace).expect("set workspace cwd");
+
+    let sensitive_dir = root.path().join("sensitive-dir");
+    std::fs::create_dir_all(&sensitive_dir).expect("create sensitive dir");
+
+    let engine = AgentEngine::new_test(manager.clone(), config, root.path()).await;
+    {
+        let mut model = engine.operator_model.write().await;
+        model.risk_fingerprint.risk_tolerance =
+            crate::agent::operator_model::RiskTolerance::Aggressive;
+    }
+    let (event_tx, _) = broadcast::channel(8);
+
+    let sensitive_path = sensitive_dir.join(".env");
+    let tool_call = ToolCall::with_default_weles_review(
+        "tool-critique-write-file-prose-anchor-drop".to_string(),
+        ToolFunction {
+            name: "write_file".to_string(),
+            arguments: serde_json::json!({
+                "path": sensitive_path,
+                "cwd": sensitive_dir,
+                "content": "TOKEN=test-value"
+            })
+            .to_string(),
+        },
+    );
+
+    let result = execute_tool(
+        &tool_call,
+        &engine,
+        "thread-critique-write-file-prose-anchor-drop",
+        None,
+        &manager,
+        None,
+        &event_tx,
+        root.path(),
+        &engine.http_client,
+        None,
+    )
+    .await;
+
+    std::env::set_current_dir(&original_cwd).expect("restore cwd");
+
+    assert!(!result.is_error, "{}", result.content);
+    assert!(workspace.join(".env").exists(), "narrowed basename should resolve against neutral cwd");
+    assert!(
+        !sensitive_path.exists(),
+        "critique should drop cwd anchoring so execution does not land in the original sensitive directory"
+    );
+    let review = result
+        .weles_review
+        .expect("successful write should preserve critique review metadata");
+    assert!(review
+        .reasons
+        .iter()
+        .any(|reason| reason == "critique_applied:file:narrow_path:path"));
+    assert!(review
+        .reasons
+        .iter()
+        .any(|reason| reason == "critique_applied:file:drop_cwd_anchor"));
+}
+
+#[tokio::test]
 async fn critique_modifications_narrow_sensitive_write_file_path_end_to_end() {
     let root = tempdir().expect("tempdir should succeed");
     let manager = SessionManager::new_test(root.path()).await;
@@ -5901,6 +6808,238 @@ fn apply_critique_modifications_uses_typed_directive_for_sensitive_file_narrowin
 
     assert_eq!(adjusted["path"].as_str(), Some(".env"));
     assert!(changes.iter().any(|item| item == "file:narrow_path:path"));
+}
+
+#[tokio::test]
+async fn fetch_url_openapi_spec_emits_openapi_tool_synthesis_proposal_notice() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind openapi spec server");
+    let addr = listener.local_addr().expect("openapi spec local addr");
+    let spec_body = serde_json::json!({
+        "openapi": "3.0.0",
+        "servers": [{"url": format!("http://{addr}")}],
+        "paths": {
+            "/status": {
+                "get": {
+                    "operationId": "getStatus",
+                    "summary": "Fetch status",
+                    "parameters": [
+                        {
+                            "name": "verbose",
+                            "in": "query",
+                            "required": false,
+                            "schema": {"type": "boolean"},
+                            "description": "Verbose output"
+                        }
+                    ]
+                }
+            }
+        }
+    })
+    .to_string();
+
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                break;
+            };
+            let spec_body = spec_body.clone();
+            tokio::spawn(async move {
+                let mut buffer = vec![0u8; 8192];
+                let _ = socket.read(&mut buffer).await.expect("read spec request");
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    spec_body.len(),
+                    spec_body
+                );
+                socket
+                    .write_all(response.as_bytes())
+                    .await
+                    .expect("write spec response");
+            });
+        }
+    });
+
+    let root = tempdir().expect("tempdir should succeed");
+    let manager = SessionManager::new_test(root.path()).await;
+    let mut config = AgentConfig::default();
+    config.tool_synthesis.enabled = true;
+    config.extra.insert(
+        "browse_provider".to_string(),
+        serde_json::Value::String("none".to_string()),
+    );
+    let engine = AgentEngine::new_test(manager.clone(), config, root.path()).await;
+    let (event_tx, mut event_rx) = broadcast::channel(8);
+
+    let spec_url = format!("http://{addr}/openapi.json");
+    let result = execute_tool(
+        &ToolCall {
+            id: "call-fetch-openapi-spec".to_string(),
+            function: ToolFunction {
+                name: "fetch_url".to_string(),
+                arguments: serde_json::json!({
+                    "url": spec_url,
+                    "max_length": 10_000,
+                })
+                .to_string(),
+            },
+            weles_review: None,
+        },
+        &engine,
+        "thread-openapi-gap",
+        None,
+        &manager,
+        None,
+        &event_tx,
+        root.path(),
+        &engine.http_client,
+        None,
+    )
+    .await;
+
+    assert!(!result.is_error, "fetch_url should succeed: {}", result.content);
+
+    let notice = timeout(Duration::from_millis(250), event_rx.recv())
+        .await
+        .expect("expected synthesis proposal workflow notice")
+        .expect("workflow notice should be received");
+    match notice {
+        AgentEvent::WorkflowNotice {
+            kind,
+            details: Some(details),
+            ..
+        } => {
+            assert_eq!(kind, "tool-synthesis-proposal");
+            let details: serde_json::Value =
+                serde_json::from_str(&details).expect("notice details should be json");
+            assert_eq!(
+                details.get("proposal_kind").and_then(|value| value.as_str()),
+                Some("openapi")
+            );
+            let synth_args = details
+                .get("synthesize_tool_args")
+                .expect("proposal should include synthesize_tool args");
+            assert_eq!(synth_args.get("kind").and_then(|value| value.as_str()), Some("openapi"));
+            assert_eq!(
+                synth_args.get("target").and_then(|value| value.as_str()),
+                Some(spec_url.as_str())
+            );
+            assert_eq!(
+                synth_args.get("operation_id").and_then(|value| value.as_str()),
+                Some("getStatus")
+            );
+        }
+        other => panic!("expected workflow notice, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn fetch_url_openapi_spec_does_not_emit_proposal_when_equivalent_generated_tool_exists() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind openapi spec server");
+    let addr = listener.local_addr().expect("openapi spec local addr");
+    let spec_body = serde_json::json!({
+        "openapi": "3.0.0",
+        "servers": [{"url": format!("http://{addr}")}],
+        "paths": {
+            "/status": {
+                "get": {
+                    "operationId": "getStatus",
+                    "summary": "Fetch status"
+                }
+            }
+        }
+    })
+    .to_string();
+
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                break;
+            };
+            let spec_body = spec_body.clone();
+            tokio::spawn(async move {
+                let mut buffer = vec![0u8; 8192];
+                let _ = socket.read(&mut buffer).await.expect("read spec request");
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    spec_body.len(),
+                    spec_body
+                );
+                socket
+                    .write_all(response.as_bytes())
+                    .await
+                    .expect("write spec response");
+            });
+        }
+    });
+
+    let root = tempdir().expect("tempdir should succeed");
+    let manager = SessionManager::new_test(root.path()).await;
+    let mut config = AgentConfig::default();
+    config.tool_synthesis.enabled = true;
+    config.extra.insert(
+        "browse_provider".to_string(),
+        serde_json::Value::String("none".to_string()),
+    );
+    let engine = AgentEngine::new_test(manager.clone(), config, root.path()).await;
+    let (event_tx, mut event_rx) = broadcast::channel(8);
+
+    let spec_url = format!("http://{addr}/openapi.json");
+    engine
+        .synthesize_tool_json(
+            &serde_json::json!({
+                "kind": "openapi",
+                "target": spec_url,
+                "operation_id": "getStatus",
+                "name": "getstatus",
+                "activate": false,
+            })
+            .to_string(),
+        )
+        .await
+        .expect("synthesize generated OpenAPI tool");
+
+    let result = execute_tool(
+        &ToolCall {
+            id: "call-fetch-openapi-existing".to_string(),
+            function: ToolFunction {
+                name: "fetch_url".to_string(),
+                arguments: serde_json::json!({
+                    "url": format!("http://{addr}/openapi.json"),
+                    "max_length": 10_000,
+                })
+                .to_string(),
+            },
+            weles_review: None,
+        },
+        &engine,
+        "thread-openapi-gap-existing",
+        None,
+        &manager,
+        None,
+        &event_tx,
+        root.path(),
+        &engine.http_client,
+        None,
+    )
+    .await;
+
+    assert!(!result.is_error, "fetch_url should succeed: {}", result.content);
+    assert!(
+        timeout(Duration::from_millis(150), event_rx.recv())
+            .await
+            .is_err(),
+        "existing equivalent generated OpenAPI tool should suppress fresh synthesis proposal notices"
+    );
 }
 
 #[tokio::test]
@@ -6903,6 +8042,105 @@ async fn read_memory_includes_thread_structural_graph_neighbors() {
                 .get("relation_type")
                 .and_then(|value| value.as_str())
                 == Some("file_in_package")
+    }));
+}
+
+#[tokio::test]
+async fn search_memory_uses_preferred_structural_refs_for_graph_lookup_without_memory_graph() {
+    let root = tempdir().expect("tempdir");
+    let manager = SessionManager::new_test(root.path()).await;
+    let engine = AgentEngine::new_test(manager.clone(), AgentConfig::default(), root.path()).await;
+    let (event_tx, _) = broadcast::channel(8);
+    let thread_id = "thread-search-memory-preferred-structural-lookup";
+    let agent_data_dir = root.path().join("agent");
+    engine.threads.write().await.insert(
+        thread_id.to_string(),
+        make_thread(
+            thread_id,
+            Some(crate::agent::agent_identity::MAIN_AGENT_NAME),
+            "Search memory preferred structural lookup",
+            false,
+            1,
+            1,
+            vec![crate::agent::types::AgentMessage::user("search parser graph", 1)],
+        ),
+    );
+
+    write_scope_memory_files(
+        &agent_data_dir,
+        crate::agent::agent_identity::MAIN_AGENT_ID,
+        "# Soul\n\n- Stable soul fact\n",
+        "# Memory\n\n- Stable memory fact\n",
+        "# User\n\n- Stable user fact\n",
+    );
+    engine.thread_structural_memories.write().await.insert(
+        thread_id.to_string(),
+        crate::agent::context::structural_memory::ThreadStructuralMemory {
+            observed_files: vec![
+                crate::agent::context::structural_memory::ObservedFileNode {
+                    node_id: "node:file:src/lib.rs".to_string(),
+                    relative_path: "src/lib.rs".to_string(),
+                },
+                crate::agent::context::structural_memory::ObservedFileNode {
+                    node_id: "node:file:src/parser.rs".to_string(),
+                    relative_path: "src/parser.rs".to_string(),
+                },
+            ],
+            edges: vec![crate::agent::context::structural_memory::StructuralEdge {
+                from: "node:file:src/lib.rs".to_string(),
+                to: "node:file:src/parser.rs".to_string(),
+                kind: "imported_file".to_string(),
+            }],
+            ..Default::default()
+        },
+    );
+
+    let tool_call = ToolCall::with_default_weles_review(
+        "tool-search-memory-preferred-structural-lookup".to_string(),
+        ToolFunction {
+            name: "search_memory".to_string(),
+            arguments: serde_json::json!({
+                "query": "parser",
+                "limit": 5,
+                "include_base_markdown": false,
+                "include_operator_profile_json": false,
+                "include_operator_model_summary": false,
+                "include_thread_structural_memory": true
+            })
+            .to_string(),
+        },
+    );
+
+    let result = execute_tool(
+        &tool_call,
+        &engine,
+        thread_id,
+        None,
+        &manager,
+        None,
+        &event_tx,
+        &agent_data_dir,
+        &engine.http_client,
+        None,
+    )
+    .await;
+
+    assert!(!result.is_error, "search_memory should succeed: {}", result.content);
+    let payload: serde_json::Value =
+        serde_json::from_str(&result.content).expect("search_memory should return JSON");
+    let matches = payload
+        .get("matches")
+        .and_then(|value| value.as_array())
+        .expect("search_memory should return matches");
+    assert!(matches.iter().any(|item| {
+        item.get("layer").and_then(|value| value.as_str()) == Some("thread_structural_memory")
+            && item
+                .get("snippet")
+                .and_then(|value| value.as_str())
+                .is_some_and(|snippet| {
+                    snippet.contains("Graph lookup from node:file:src/lib.rs")
+                        && snippet.contains("src/parser.rs")
+                })
     }));
 }
 

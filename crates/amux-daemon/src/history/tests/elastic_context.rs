@@ -416,6 +416,62 @@ mod structural_memory {
     }
 
     #[tokio::test]
+    async fn persisted_thread_structural_memory_supports_graph_lookup() -> Result<()> {
+        let (store, root) = make_test_store().await?;
+
+        let memory = crate::agent::context::structural_memory::ThreadStructuralMemory {
+            workspace_seed_scan_complete: true,
+            language_hints: vec!["rust".to_string()],
+            workspace_seeds: vec![crate::agent::context::structural_memory::WorkspaceSeed {
+                node_id: "node:file:Cargo.toml".to_string(),
+                relative_path: "Cargo.toml".to_string(),
+                kind: "cargo_manifest".to_string(),
+            }],
+            observed_files: vec![crate::agent::context::structural_memory::ObservedFileNode {
+                node_id: "node:file:src/lib.rs".to_string(),
+                relative_path: "src/lib.rs".to_string(),
+            }],
+            edges: vec![
+                crate::agent::context::structural_memory::StructuralEdge {
+                    from: "node:file:src/lib.rs".to_string(),
+                    to: "node:file:src/parser.rs".to_string(),
+                    kind: "imported_file".to_string(),
+                },
+                crate::agent::context::structural_memory::StructuralEdge {
+                    from: "node:file:src/lib.rs".to_string(),
+                    to: "node:package:cargo:demo".to_string(),
+                    kind: "file_in_package".to_string(),
+                },
+            ],
+        };
+
+        store
+            .upsert_thread_structural_memory_state("thread-graph-lookup", &memory, 1_717_170_892)
+            .await?;
+
+        let restored: crate::agent::context::structural_memory::ThreadStructuralMemory = store
+            .get_thread_structural_memory_state("thread-graph-lookup")
+            .await?
+            .expect("typed thread structural memory should be stored");
+
+        let neighbors = restored.graph_lookup(&["node:file:src/lib.rs".to_string()], 4);
+        assert_eq!(neighbors.len(), 2);
+        assert!(neighbors.iter().any(|neighbor| {
+            neighbor.node_id == "node:file:src/parser.rs"
+                && neighbor.relation_kind == "imported_file"
+                && neighbor.direction == "outgoing"
+        }));
+        assert!(neighbors.iter().any(|neighbor| {
+            neighbor.node_id == "node:package:cargo:demo"
+                && neighbor.relation_kind == "file_in_package"
+                && neighbor.direction == "outgoing"
+        }));
+
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn observed_file_enrichment_uses_filename_and_cwd_relative_resolution() -> Result<()> {
         let (_store, root) = make_test_store().await?;
 

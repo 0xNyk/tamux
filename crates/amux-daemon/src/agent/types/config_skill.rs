@@ -345,6 +345,7 @@ pub struct ConsolidationResult {
     pub forge_patterns_detected: usize,
     pub forge_hints_generated: usize,
     pub forge_hints_auto_applied: usize,
+    pub forge_hints_logged_only: usize,
     pub facts_decayed: usize,
     pub tombstones_purged: usize,
     pub facts_refined: usize,

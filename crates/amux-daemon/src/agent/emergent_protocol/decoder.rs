@@ -4,6 +4,14 @@ pub(crate) fn classify_pattern_key(input: &str) -> Option<super::types::Protocol
         return None;
     }
 
+    if normalized.contains(" -> ")
+        && normalized
+            .split(" -> ")
+            .all(|segment| !segment.trim().is_empty())
+    {
+        return Some(super::types::ProtocolSignalKind::RepeatedShorthand);
+    }
+
     if matches!(normalized, "continue" | "go on" | "keep going") {
         return Some(super::types::ProtocolSignalKind::RepeatedContinuationCue);
     }

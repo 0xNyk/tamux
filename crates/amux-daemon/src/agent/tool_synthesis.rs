@@ -245,6 +245,38 @@ pub(crate) fn find_equivalent_generated_cli_tool(
     Ok(None)
 }
 
+pub(crate) fn find_equivalent_generated_openapi_tool(
+    agent_data_dir: &Path,
+    spec_url: &str,
+    operation_id: Option<&str>,
+) -> Result<Option<serde_json::Value>> {
+    let normalized_spec_url = spec_url.trim();
+    for tool in load_generated_tools(agent_data_dir)? {
+        if tool.status == "archived" {
+            continue;
+        }
+        let Some(openapi) = tool.openapi.as_ref() else {
+            continue;
+        };
+        if openapi.spec_url.trim() != normalized_spec_url {
+            continue;
+        }
+        if let Some(operation_id) = operation_id {
+            if openapi.operation_id.as_deref() != Some(operation_id) {
+                continue;
+            }
+        }
+        return Ok(Some(serde_json::json!({
+            "id": tool.id,
+            "name": tool.name,
+            "status": tool.status,
+            "spec_url": normalized_spec_url,
+            "operation_id": openapi.operation_id,
+        })));
+    }
+    Ok(None)
+}
+
 pub(super) async fn execute_generated_tool(
     tool_name: &str,
     args: &serde_json::Value,

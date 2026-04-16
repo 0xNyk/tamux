@@ -202,6 +202,58 @@ async fn metacognitive_confirmation_warning_restarts_with_reflection_before_tool
 }
 
 #[tokio::test]
+async fn metacognitive_learning_updates_persist_across_rehydrate() {
+    let root = tempdir().unwrap();
+    let manager = SessionManager::new_test(root.path()).await;
+    let engine = AgentEngine::new_test(manager, AgentConfig::default(), root.path()).await;
+
+    engine
+        .reinforce_meta_cognitive_bias_occurrence("confirmation")
+        .await;
+    engine
+        .apply_meta_cognitive_calibration_adjustment(
+            -0.08,
+            crate::agent::explanation::ConfidenceBand::Likely,
+        )
+        .await;
+
+    let live_model = engine.meta_cognitive_self_model.read().await.clone();
+    let live_confirmation = live_model
+        .biases
+        .iter()
+        .find(|bias| bias.name == "confirmation")
+        .expect("confirmation bias should exist")
+        .occurrence_count;
+    assert!(live_confirmation >= 1);
+    assert!(live_model.calibration_offset < 0.0);
+
+    let rehydrated = AgentEngine::new_test(
+        SessionManager::new_test(root.path()).await,
+        AgentConfig::default(),
+        root.path(),
+    )
+    .await;
+    rehydrated.hydrate().await.expect("hydrate should succeed");
+
+    let loaded_model = rehydrated.meta_cognitive_self_model.read().await.clone();
+    let loaded_confirmation = loaded_model
+        .biases
+        .iter()
+        .find(|bias| bias.name == "confirmation")
+        .expect("confirmation bias should exist after hydrate")
+        .occurrence_count;
+
+    assert!(
+        loaded_model.calibration_offset < 0.0,
+        "metacognitive calibration adjustments should persist across rehydrate"
+    );
+    assert!(
+        loaded_confirmation >= 1,
+        "bias occurrence reinforcement should persist across rehydrate"
+    );
+}
+
+#[tokio::test]
 async fn neutral_investigative_sequence_does_not_false_positive_confirmation_bias() {
     let root = tempdir().unwrap();
     let readable_path = root.path().join("neutral.txt");

@@ -36,6 +36,12 @@ pub(super) const DOMOWOJ_AGENT_ID: &str = "domowoj";
 pub(super) const DOMOWOJ_AGENT_NAME: &str = "Domowoj";
 pub(super) const SWIETOWIT_AGENT_ID: &str = "swietowit";
 pub(super) const SWIETOWIT_AGENT_NAME: &str = "Swietowit";
+pub(super) const PERUN_AGENT_ID: &str = "perun";
+pub(super) const PERUN_AGENT_NAME: &str = "Perun";
+pub(super) const MOKOSH_AGENT_ID: &str = "mokosh";
+pub(super) const MOKOSH_AGENT_NAME: &str = "Mokosh";
+pub(super) const DAZHBOG_AGENT_ID: &str = "dazhbog";
+pub(super) const DAZHBOG_AGENT_NAME: &str = "Dazhbog";
 pub(super) const ROD_AGENT_ID: &str = "rod";
 pub(super) const ROD_AGENT_NAME: &str = "Rod";
 pub(super) const WELES_AGENT_ID: &str = "weles";
@@ -50,7 +56,7 @@ struct PersonaSeed {
     guidance: &'static str,
 }
 
-const SPAWNED_PERSONAS: [PersonaSeed; 6] = [
+const SPAWNED_PERSONAS: [PersonaSeed; 9] = [
     PersonaSeed {
         id: SWAROZYC_AGENT_ID,
         name: SWAROZYC_AGENT_NAME,
@@ -70,6 +76,21 @@ const SPAWNED_PERSONAS: [PersonaSeed; 6] = [
         id: SWIETOWIT_AGENT_ID,
         name: SWIETOWIT_AGENT_NAME,
         guidance: "You maintain broader situational awareness than most subagents and should keep the surrounding architecture in view.",
+    },
+    PersonaSeed {
+        id: PERUN_AGENT_ID,
+        name: PERUN_AGENT_NAME,
+        guidance: "You are decisive, forceful, and comfortable making hard calls under uncertainty. Favor robust action, security, and infrastructure discipline.",
+    },
+    PersonaSeed {
+        id: MOKOSH_AGENT_ID,
+        name: MOKOSH_AGENT_NAME,
+        guidance: "You are steady, careful, and maintenance-minded. Favor reliability, operational continuity, and durable local care for the working environment.",
+    },
+    PersonaSeed {
+        id: DAZHBOG_AGENT_ID,
+        name: DAZHBOG_AGENT_NAME,
+        guidance: "You bring illumination and clarity. Favor turning complexity into a crisp plan, a clear explanation, or an immediately useful next step.",
     },
     PersonaSeed {
         id: ROD_AGENT_ID,
@@ -112,6 +133,7 @@ pub(super) fn canonical_agent_id(alias: &str) -> &'static str {
         CONCIERGE_AGENT_ID | CONCIERGE_AGENT_ALIAS | CONCIERGE_AGENT_LEGACY_ALIAS => {
             CONCIERGE_AGENT_ID
         }
+        "veles" | WELES_AGENT_ID => WELES_AGENT_ID,
         _ => persona_by_alias(&normalized)
             .map(|persona| persona.id)
             .unwrap_or(MAIN_AGENT_ID),
@@ -125,6 +147,9 @@ pub(super) fn canonical_agent_name(alias: &str) -> &'static str {
         RADOGOST_AGENT_ID => RADOGOST_AGENT_NAME,
         DOMOWOJ_AGENT_ID => DOMOWOJ_AGENT_NAME,
         SWIETOWIT_AGENT_ID => SWIETOWIT_AGENT_NAME,
+        PERUN_AGENT_ID => PERUN_AGENT_NAME,
+        MOKOSH_AGENT_ID => MOKOSH_AGENT_NAME,
+        DAZHBOG_AGENT_ID => DAZHBOG_AGENT_NAME,
         ROD_AGENT_ID => ROD_AGENT_NAME,
         WELES_AGENT_ID => WELES_AGENT_NAME,
         _ => MAIN_AGENT_NAME,
@@ -168,7 +193,13 @@ pub(crate) fn is_weles_agent_scope(scope: &str) -> bool {
 pub(super) fn is_explicit_builtin_persona_scope(alias: &str) -> bool {
     matches!(
         canonical_agent_id(alias),
-        SWAROZYC_AGENT_ID | RADOGOST_AGENT_ID | DOMOWOJ_AGENT_ID | SWIETOWIT_AGENT_ID
+        SWAROZYC_AGENT_ID
+            | RADOGOST_AGENT_ID
+            | DOMOWOJ_AGENT_ID
+            | SWIETOWIT_AGENT_ID
+            | PERUN_AGENT_ID
+            | MOKOSH_AGENT_ID
+            | DAZHBOG_AGENT_ID
     )
 }
 
@@ -181,6 +212,9 @@ pub(super) fn builtin_persona_overrides<'a>(
         RADOGOST_AGENT_ID => Some(&config.builtin_sub_agents.radogost),
         DOMOWOJ_AGENT_ID => Some(&config.builtin_sub_agents.domowoj),
         SWIETOWIT_AGENT_ID => Some(&config.builtin_sub_agents.swietowit),
+        PERUN_AGENT_ID => Some(&config.builtin_sub_agents.perun),
+        MOKOSH_AGENT_ID => Some(&config.builtin_sub_agents.mokosh),
+        DAZHBOG_AGENT_ID => Some(&config.builtin_sub_agents.dazhbog),
         _ => None,
     }
 }
@@ -426,6 +460,7 @@ mod tests {
             CONCIERGE_AGENT_ID
         );
         assert_eq!(canonical_agent_id(MAIN_AGENT_FALLBACK_ALIAS), MAIN_AGENT_ID);
+        assert_eq!(canonical_agent_id("veles"), WELES_AGENT_ID);
     }
 
     #[test]
@@ -433,6 +468,12 @@ mod tests {
         assert_eq!(canonical_agent_id(RADOGOST_AGENT_ID), RADOGOST_AGENT_ID);
         assert_eq!(canonical_agent_id("Radogost"), RADOGOST_AGENT_ID);
         assert_eq!(canonical_agent_name(RADOGOST_AGENT_ID), RADOGOST_AGENT_NAME);
+        assert_eq!(canonical_agent_id("perun"), "perun");
+        assert_eq!(canonical_agent_name("perun"), "Perun");
+        assert_eq!(canonical_agent_id("mokosh"), "mokosh");
+        assert_eq!(canonical_agent_name("mokosh"), "Mokosh");
+        assert_eq!(canonical_agent_id("dazhbog"), "dazhbog");
+        assert_eq!(canonical_agent_name("dazhbog"), "Dazhbog");
     }
 
     #[test]

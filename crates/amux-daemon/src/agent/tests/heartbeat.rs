@@ -302,6 +302,7 @@ fn format_anticipatory_items_highlights_system_outcome_foresight_for_operator() 
                 "hydration age=16m exceeded session rhythm window=10m".to_string(),
                 "semantic alignment degraded across recent thread messages".to_string(),
             ],
+            intent_prediction: None,
             confidence: 0.76,
             goal_run_id: None,
             thread_id: Some("thread-1".to_string()),
@@ -319,6 +320,7 @@ fn format_anticipatory_items_highlights_system_outcome_foresight_for_operator() 
                 "prediction_type=build_test_risk".to_string(),
                 "dirty repo state: modified=2 staged=0 untracked=0".to_string(),
             ],
+            intent_prediction: None,
             confidence: 0.78,
             goal_run_id: None,
             thread_id: Some("thread-2".to_string()),
@@ -331,6 +333,8 @@ fn format_anticipatory_items_highlights_system_outcome_foresight_for_operator() 
 
     assert!(output.contains("system_outcome_foresight"));
     assert!(output.contains("OPERATOR-VISIBLE FORESIGHT"));
+    assert!(output.contains("trigger=stale_context"));
+    assert!(output.contains("trigger=build_test_risk"));
     assert!(output.contains("stale context"));
     assert!(output.contains("build/test failure risk"));
     assert!(output.contains("prediction_type=stale_context"));
@@ -356,6 +360,25 @@ fn format_consolidation_forge_summary_surfaces_strategy_learning() {
 }
 
 #[test]
+fn format_consolidation_forge_summary_surfaces_logged_only_hints() {
+    let output = super::helpers::format_consolidation_forge_summary(&ConsolidationResult {
+        forge_ran: true,
+        forge_traces_analyzed: 11,
+        forge_patterns_detected: 2,
+        forge_hints_generated: 3,
+        forge_hints_auto_applied: 1,
+        forge_hints_logged_only: 2,
+        ..Default::default()
+    })
+    .expect("forge summary should be present when forge ran");
+
+    assert!(
+        output.contains("2 logged-only"),
+        "unexpected forge summary: {output}"
+    );
+}
+
+#[test]
 fn format_consolidation_dream_summary_surfaces_what_the_system_considered_while_idle() {
     let output = super::helpers::format_consolidation_dream_summary(&ConsolidationResult {
         distillation_ran: true,
@@ -374,6 +397,23 @@ fn format_consolidation_dream_summary_surfaces_what_the_system_considered_while_
     assert!(output.contains("4 thread(s)"));
     assert!(output.contains("2 memory update(s)"));
     assert!(output.contains("3 recurring pattern(s)"));
+}
+
+#[test]
+fn format_consolidation_dream_summary_surfaces_distillation_review_queue() {
+    let output = super::helpers::format_consolidation_dream_summary(&ConsolidationResult {
+        distillation_ran: true,
+        distillation_threads_analyzed: 3,
+        distillation_auto_applied: 1,
+        distillation_queued_for_review: 2,
+        ..Default::default()
+    })
+    .expect("dream summary should be present when distillation ran");
+
+    assert!(
+        output.contains("2 queued for review"),
+        "unexpected dream summary: {output}"
+    );
 }
 
 #[tokio::test]

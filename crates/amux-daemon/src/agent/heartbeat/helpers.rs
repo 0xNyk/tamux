@@ -111,14 +111,26 @@ pub(super) fn format_anticipatory_items_for_heartbeat(items: &[AnticipatoryItem]
             } else {
                 "ACTIONABLE"
             };
+            let trigger_suffix = item
+                .bullets
+                .iter()
+                .find_map(|bullet| bullet.strip_prefix("prediction_type="))
+                .map(|value| format!(" trigger={}", value.trim()))
+                .unwrap_or_default();
             let bullets_text = if !item.bullets.is_empty() {
                 format!("\n    Bullets: {}", item.bullets.join(", "))
             } else {
                 String::new()
             };
             format!(
-                "- [{}] ({}) {} (confidence: {:.2}): {}{}",
-                item.kind, priority_hint, item.title, item.confidence, item.summary, bullets_text
+                "- [{}] ({}) {}{} (confidence: {:.2}): {}{}",
+                item.kind,
+                priority_hint,
+                item.title,
+                trigger_suffix,
+                item.confidence,
+                item.summary,
+                bullets_text
             )
         })
         .collect::<Vec<_>>()
@@ -130,12 +142,19 @@ pub(super) fn format_consolidation_forge_summary(result: &ConsolidationResult) -
         return None;
     }
 
+    let logged_only_suffix = if result.forge_hints_logged_only > 0 {
+        format!(", {} logged-only", result.forge_hints_logged_only)
+    } else {
+        String::new()
+    };
+
     Some(format!(
-        "forge learned from {} traces: {} pattern(s), {} hint(s) generated, {} auto-applied.",
+        "forge learned from {} traces: {} pattern(s), {} hint(s) generated, {} auto-applied{}.",
         result.forge_traces_analyzed,
         result.forge_patterns_detected,
         result.forge_hints_generated,
         result.forge_hints_auto_applied,
+        logged_only_suffix,
     ))
 }
 
@@ -148,10 +167,20 @@ pub(super) fn format_consolidation_dream_summary(result: &ConsolidationResult) -
         return None;
     }
 
+    let review_queue_suffix = if result.distillation_queued_for_review > 0 {
+        format!(
+            ", {} queued for review",
+            result.distillation_queued_for_review
+        )
+    } else {
+        String::new()
+    };
+
     Some(format!(
-        "Dream state: what the system considered while idle — {} thread(s), {} memory update(s), {} recurring pattern(s), {} refined fact(s), {} promoted skill(s).",
+        "Dream state: what the system considered while idle — {} thread(s), {} memory update(s){}, {} recurring pattern(s), {} refined fact(s), {} promoted skill(s).",
         result.distillation_threads_analyzed,
         result.distillation_auto_applied,
+        review_queue_suffix,
         result.forge_patterns_detected,
         result.facts_refined,
         result.skills_promoted,

@@ -41,7 +41,7 @@ impl AgentEngine {
                 },
             ]
         });
-        let session = create_debate_session(
+        let mut session = create_debate_session(
             topic.to_string(),
             framings,
             cfg.default_max_rounds,
@@ -49,9 +49,55 @@ impl AgentEngine {
             Some(thread_id.to_string()),
             goal_run_id.map(str::to_string),
         )?;
-        let session_id = session.id.clone();
         self.persist_debate_session(&session).await?;
-        Ok(session_id)
+
+        let opening_round = session.current_round;
+        let opening_roles = session.roles.clone();
+        for role in opening_roles {
+            let content = match role.role {
+                RoleKind::Proponent => format!(
+                    "Round {} opening case for '{}': defend the strongest actionable path with evidence.",
+                    opening_round, session.topic
+                ),
+                RoleKind::Skeptic => format!(
+                    "Round {} opening challenge for '{}': surface the sharpest evidence-backed risks and counterarguments.",
+                    opening_round, session.topic
+                ),
+                RoleKind::Synthesizer => format!(
+                    "Round {} opening synthesis for '{}': capture the main positions, early convergence, and key open tensions.",
+                    opening_round, session.topic
+                ),
+            };
+            let argument = Argument {
+                id: format!("arg_{}", uuid::Uuid::new_v4()),
+                round: opening_round,
+                role: role.role,
+                agent_id: role.agent_id,
+                content,
+                evidence_refs: vec![format!(
+                    "debate:{}:round:{}:{}",
+                    session.id,
+                    opening_round,
+                    role.role.as_str()
+                )],
+                responds_to: None,
+                timestamp_ms: now_millis(),
+            };
+            self.append_debate_argument(&session.id, argument).await?;
+        }
+
+        session = self
+            .get_persisted_debate_session(&session.id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("unknown debate session after opening round seed"))?;
+        if session.arguments.len() >= session.roles.len()
+            && session.current_round < session.max_rounds
+        {
+            advance_round(&mut session, cfg.role_rotation)?;
+            self.persist_debate_session(&session).await?;
+        }
+
+        Ok(session.id.clone())
     }
 
     pub(crate) async fn persist_debate_session(&self, session: &DebateSession) -> Result<()> {

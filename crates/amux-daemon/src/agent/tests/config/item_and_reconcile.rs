@@ -233,6 +233,43 @@ async fn prepare_agent_provider_model_json_updates_builtin_persona_overrides() {
 }
 
 #[tokio::test]
+async fn prepare_agent_provider_model_json_updates_new_builtin_persona_overrides() {
+    let root = tempdir().unwrap();
+    let manager = SessionManager::new_test(root.path()).await;
+    let engine = AgentEngine::new_test(manager, AgentConfig::default(), root.path()).await;
+
+    let mut config = engine.get_config().await;
+    config.api_key = "sk-test".to_string();
+    engine.set_config(config).await;
+
+    let prepared = engine
+        .prepare_agent_provider_model_json("perun", PROVIDER_ID_OPENAI, "gpt-5.4-mini")
+        .await
+        .expect("new builtin persona provider/model preparation should succeed");
+
+    let prepared_json = serde_json::to_value(&prepared).expect("config should serialize");
+    assert_eq!(
+        prepared_json["builtin_sub_agents"]["perun"]["provider"].as_str(),
+        Some(PROVIDER_ID_OPENAI)
+    );
+    assert_eq!(
+        prepared_json["builtin_sub_agents"]["perun"]["model"].as_str(),
+        Some("gpt-5.4-mini")
+    );
+
+    let current_json =
+        serde_json::to_value(engine.get_config().await).expect("config should serialize");
+    assert!(
+        current_json["builtin_sub_agents"]["perun"]["provider"].is_null(),
+        "runtime config should not be mutated during preparation"
+    );
+    assert!(
+        current_json["builtin_sub_agents"]["perun"]["model"].is_null(),
+        "runtime config should not be mutated during preparation"
+    );
+}
+
+#[tokio::test]
 async fn persisted_config_is_visible_while_runtime_reconcile_is_still_in_flight() {
     let root = tempdir().unwrap();
     let manager = SessionManager::new_test(root.path()).await;

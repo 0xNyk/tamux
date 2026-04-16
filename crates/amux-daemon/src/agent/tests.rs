@@ -795,6 +795,112 @@ async fn request_goal_plan_adapts_prompt_and_truncates_output_when_satisfaction_
     );
 }
 
+#[test]
+fn behavior_adaptation_profile_requests_clarification_when_strained_and_corrections_are_present() {
+    let mut model = OperatorModel::default();
+    model.cognitive_style.message_count = 1;
+    model.operator_satisfaction.label = "strained".to_string();
+    model.operator_satisfaction.score = 0.18;
+    model.implicit_feedback.correction_message_count = 1;
+    model.implicit_feedback.top_tool_fallbacks = vec![
+        "read_file -> search_files".to_string(),
+        "bash_command -> read_file".to_string(),
+    ];
+
+    let profile = BehaviorAdaptationProfile::from_model(&model);
+    assert_eq!(profile.mode, SatisfactionAdaptationMode::Minimal);
+    assert!(profile.prompt_for_clarification);
+    assert!(profile.compact_response);
+    assert_eq!(
+        profile.preferred_tool_fallbacks,
+        vec!["search_files".to_string(), "read_file".to_string()]
+    );
+}
+
+#[test]
+fn behavior_adaptation_profile_tightens_clarification_and_compactness_when_fragile_feedback_appears(
+) {
+    let mut model = OperatorModel::default();
+    model.cognitive_style.message_count = 1;
+    model.operator_satisfaction.label = "fragile".to_string();
+    model.operator_satisfaction.score = 0.54;
+    model.implicit_feedback.correction_message_count = 1;
+
+    let profile = BehaviorAdaptationProfile::from_model(&model);
+    assert_eq!(profile.mode, SatisfactionAdaptationMode::Tightened);
+    assert!(profile.prompt_for_clarification);
+    assert!(profile.compact_response);
+}
+
+#[tokio::test]
+async fn request_goal_plan_injects_targeted_clarification_guidance_when_behavior_adapter_requires_it(
+) {
+    let recorded_bodies = Arc::new(StdMutex::new(VecDeque::new()));
+    let plan_payload = serde_json::json!({
+        "title": "Execution plan",
+        "summary": "Use the normal execution mode.",
+        "steps": [
+            {
+                "title": "Step 1",
+                "instructions": "Inspect the current state.",
+                "kind": "research",
+                "success_criteria": "current state understood",
+                "session_id": null,
+                "llm_confidence": "likely",
+                "llm_confidence_rationale": "small inspection"
+            },
+            {
+                "title": "Step 2",
+                "instructions": "Apply the smallest viable fix.",
+                "kind": "command",
+                "success_criteria": "fix applied",
+                "session_id": null,
+                "llm_confidence": "likely",
+                "llm_confidence_rationale": "direct change"
+            }
+        ],
+        "rejected_alternatives": ["Alternative A: broader but slower"]
+    })
+    .to_string();
+
+    let root = tempdir().expect("tempdir");
+    let manager = SessionManager::new_test(root.path()).await;
+    let mut config = AgentConfig::default();
+    config.provider = "openai".to_string();
+    config.base_url = spawn_goal_recording_server(recorded_bodies.clone(), plan_payload).await;
+    config.model = "gpt-4o-mini".to_string();
+    config.api_key = "test-key".to_string();
+    config.api_transport = ApiTransport::ChatCompletions;
+    config.auto_retry = false;
+    config.max_retries = 0;
+    config.max_tool_loops = 1;
+    let engine = AgentEngine::new_test(manager, config, root.path()).await;
+
+    {
+        let mut model = engine.operator_model.write().await;
+        model.cognitive_style.message_count = 1;
+        model.operator_satisfaction.score = 0.18;
+        model.operator_satisfaction.label = "strained".to_string();
+        model.implicit_feedback.correction_message_count = 1;
+        model.implicit_feedback.top_tool_fallbacks = vec![
+            "read_file -> search_files".to_string(),
+            "bash_command -> read_file".to_string(),
+        ];
+    }
+
+    let _plan = engine
+        .request_goal_plan(&sample_goal_run())
+        .await
+        .expect("goal plan should succeed");
+
+    let recorded = recorded_bodies.lock().expect("lock recorded bodies");
+    let body = recorded.back().expect("expected one recorded request body");
+    assert!(
+        body.contains("targeted clarification checkpoint"),
+        "expected explicit clarification guidance in the plan prompt"
+    );
+}
+
 #[tokio::test]
 async fn request_goal_plan_adapts_execution_recommendation_when_satisfaction_is_strained() {
     let plan_payload = serde_json::json!({
@@ -890,4 +996,72 @@ async fn request_goal_plan_adapts_execution_recommendation_when_satisfaction_is_
     assert!(strained_plan
         .summary
         .contains("keep iteration bounds short"));
+}
+
+#[tokio::test]
+async fn request_goal_plan_injects_compact_delivery_guidance_when_behavior_adapter_requires_it() {
+    let recorded_bodies = Arc::new(StdMutex::new(VecDeque::new()));
+    let plan_payload = serde_json::json!({
+        "title": "Execution plan",
+        "summary": "Use the normal execution mode.",
+        "steps": [
+            {
+                "title": "Step 1",
+                "instructions": "Inspect the current state.",
+                "kind": "research",
+                "success_criteria": "current state understood",
+                "session_id": null,
+                "llm_confidence": "likely",
+                "llm_confidence_rationale": "small inspection"
+            },
+            {
+                "title": "Step 2",
+                "instructions": "Apply the smallest viable fix.",
+                "kind": "command",
+                "success_criteria": "fix applied",
+                "session_id": null,
+                "llm_confidence": "likely",
+                "llm_confidence_rationale": "direct change"
+            }
+        ],
+        "rejected_alternatives": ["Alternative A: broader but slower"]
+    })
+    .to_string();
+
+    let root = tempdir().expect("tempdir");
+    let manager = SessionManager::new_test(root.path()).await;
+    let mut config = AgentConfig::default();
+    config.provider = "openai".to_string();
+    config.base_url = spawn_goal_recording_server(recorded_bodies.clone(), plan_payload).await;
+    config.model = "gpt-4o-mini".to_string();
+    config.api_key = "test-key".to_string();
+    config.api_transport = ApiTransport::ChatCompletions;
+    config.auto_retry = false;
+    config.max_retries = 0;
+    config.max_tool_loops = 1;
+    let engine = AgentEngine::new_test(manager, config, root.path()).await;
+
+    {
+        let mut model = engine.operator_model.write().await;
+        model.cognitive_style.message_count = 1;
+        model.operator_satisfaction.score = 0.54;
+        model.operator_satisfaction.label = "fragile".to_string();
+        model.implicit_feedback.correction_message_count = 1;
+    }
+
+    let _plan = engine
+        .request_goal_plan(&sample_goal_run())
+        .await
+        .expect("goal plan should succeed");
+
+    let recorded = recorded_bodies.lock().expect("lock recorded bodies");
+    let body = recorded.back().expect("expected one recorded request body");
+    assert!(
+        body.contains("Keep the plan summary and step instructions compact"),
+        "expected compact delivery guidance in the plan prompt"
+    );
+    assert!(
+        body.contains("targeted clarification checkpoint"),
+        "expected fragile feedback to raise clarification guidance before broad guessing"
+    );
 }

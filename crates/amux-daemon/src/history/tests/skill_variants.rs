@@ -1295,7 +1295,7 @@ async fn inspect_skill_variants_reads_persisted_fitness_score_from_record() -> R
     let variant_id = record.variant_id.clone();
     store.conn.call(move |conn| {
         conn.execute(
-            "UPDATE skill_variants SET success_count = 0, failure_count = 0, fitness_score = 7.5 WHERE variant_id = ?1",
+            "UPDATE skill_variants SET use_count = 4, success_count = 3, failure_count = 1, fitness_score = 7.5, updated_at = 4242 WHERE variant_id = ?1",
             params![variant_id],
         )?;
         Ok(())
@@ -1309,6 +1309,10 @@ async fn inspect_skill_variants_reads_persisted_fitness_score_from_record() -> R
 
     assert_eq!(item.record.fitness_score, 7.5);
     assert_eq!(item.fitness_score, 7.5);
+    assert_eq!(item.fitness_snapshot.fitness_score, 7.5);
+    assert_eq!(item.fitness_snapshot.recorded_at, 4242);
+    assert_eq!(item.fitness_snapshot.use_count, 4);
+    assert!((item.fitness_snapshot.success_rate - 0.75).abs() < f64::EPSILON);
 
     fs::remove_dir_all(root)?;
     Ok(())

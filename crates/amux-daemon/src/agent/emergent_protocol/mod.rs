@@ -602,6 +602,7 @@ fn rank_state(state: ProtocolCandidateState) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::types::{ToolCall, ToolFunction};
     use crate::agent::{types::AgentConfig, AgentEngine};
     use crate::session_manager::SessionManager;
     use tempfile::tempdir;
@@ -627,6 +628,47 @@ mod tests {
             cost_usd: None,
             reasoning: None,
             tool_calls_json: None,
+            metadata_json: None,
+        }
+    }
+
+    fn msg_with_tool_calls(
+        id: &str,
+        thread_id: &str,
+        created_at: i64,
+        role: &str,
+        content: &str,
+        tool_names: &[&str],
+    ) -> AgentDbMessage {
+        let tool_calls = tool_names
+            .iter()
+            .enumerate()
+            .map(|(index, name)| ToolCall {
+                id: format!("call_{id}_{index}"),
+                function: ToolFunction {
+                    name: (*name).to_string(),
+                    arguments: "{}".to_string(),
+                },
+                weles_review: None,
+            })
+            .collect::<Vec<_>>();
+
+        AgentDbMessage {
+            id: id.to_string(),
+            thread_id: thread_id.to_string(),
+            created_at,
+            role: role.to_string(),
+            content: content.to_string(),
+            provider: None,
+            model: None,
+            input_tokens: Some(0),
+            output_tokens: Some(0),
+            total_tokens: Some(0),
+            cost_usd: None,
+            reasoning: None,
+            tool_calls_json: Some(
+                serde_json::to_string(&tool_calls).expect("tool calls should serialize"),
+            ),
             metadata_json: None,
         }
     }
@@ -663,6 +705,64 @@ mod tests {
         assert!(stored.candidates.iter().any(|candidate| candidate.state
             == ProtocolCandidateState::Accepted
             && candidate.normalized_pattern == "continue"));
+    }
+
+    #[tokio::test]
+    async fn repeated_multi_step_tool_sequence_becomes_accepted_protocol_candidate() {
+        let root = tempdir().expect("tempdir");
+        let manager = SessionManager::new_test(root.path()).await;
+        let engine = AgentEngine::new_test(manager, AgentConfig::default(), root.path()).await;
+        let thread_id = "thread-emergent-tool-sequence";
+
+        let messages = vec![
+            msg("m1", thread_id, 1, "user", "please inspect and patch"),
+            msg_with_tool_calls(
+                "m2",
+                thread_id,
+                2,
+                "assistant",
+                "running tool sequence",
+                &["search_files", "read_file", "apply_patch"],
+            ),
+            msg("m3", thread_id, 3, "user", "again"),
+            msg_with_tool_calls(
+                "m4",
+                thread_id,
+                4,
+                "assistant",
+                "running tool sequence",
+                &["search_files", "read_file", "apply_patch"],
+            ),
+            msg("m5", thread_id, 5, "user", "one more time"),
+            msg_with_tool_calls(
+                "m6",
+                thread_id,
+                6,
+                "assistant",
+                "running tool sequence",
+                &["search_files", "read_file", "apply_patch"],
+            ),
+        ];
+
+        let analyzed = engine
+            .analyze_emergent_protocol_from_messages(thread_id, &messages)
+            .await
+            .expect("analysis should succeed")
+            .expect("candidate store should be returned");
+
+        assert!(analyzed.candidates.iter().any(|candidate| {
+            candidate.state == ProtocolCandidateState::Accepted
+                && candidate.normalized_pattern == "search_files -> read_file -> apply_patch"
+        }));
+
+        let registry = engine
+            .list_thread_protocol_registry_entries(thread_id)
+            .await
+            .expect("registry should load");
+        assert!(registry.iter().any(|entry| {
+            entry.normalized_pattern == "search_files -> read_file -> apply_patch"
+                && entry.source_candidate_id.is_some()
+        }));
     }
 
     #[tokio::test]

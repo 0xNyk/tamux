@@ -62,10 +62,19 @@ impl HistoryStore {
                             .collect::<std::result::Result<Vec<_>, _>>()?;
                         Ok(SkillVariantInspection {
                             lifecycle_summary: describe_skill_variant_lifecycle(&record, now),
-                            selection_summary: describe_skill_variant_selection(&record, &context_tags),
+                            selection_summary: describe_skill_variant_selection(
+                                &record,
+                                &context_tags,
+                            ),
                             selected_for_context: selected_id.as_deref()
                                 == Some(record.variant_id.as_str()),
                             fitness_score: record.fitness_score,
+                            fitness_snapshot: SkillVariantFitnessSnapshot {
+                                recorded_at: record.updated_at,
+                                fitness_score: record.fitness_score,
+                                use_count: record.use_count,
+                                success_rate: record.success_rate(),
+                            },
                             fitness_history,
                             record,
                         })

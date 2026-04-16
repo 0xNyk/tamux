@@ -1,6 +1,10 @@
 //! Work context tracking — TODOs, file artifacts, repo watching, and event emission.
 
+use std::collections::HashSet;
+
 use super::*;
+
+const RAPID_REVERT_WINDOW_MS: u64 = 30_000;
 
 /// Map a `GoalRunStatus` to an event-kind string for autonomy-level filtering.
 fn goal_run_status_to_event_kind(status: GoalRunStatus) -> &'static str {
@@ -348,10 +352,88 @@ impl AgentEngine {
                 updated_at: now,
             })
             .collect::<Vec<_>>();
+        self.detect_and_record_rapid_reverts(thread_id, &repo_root, &entries, now)
+            .await;
         self.merge_repo_scan_entries(thread_id, &repo_root, entries)
             .await;
         self.maybe_run_aline_startup_reconciliation_for_repo(&repo_root)
             .await;
+    }
+
+    async fn detect_and_record_rapid_reverts(
+        &self,
+        thread_id: &str,
+        repo_root: &str,
+        fresh_entries: &[WorkContextEntry],
+        detected_at: u64,
+    ) {
+        let context = {
+            let contexts = self.thread_work_contexts.read().await;
+            contexts.get(thread_id).cloned()
+        };
+        let Some(context) = context else {
+            return;
+        };
+
+        let changed_paths = fresh_entries
+            .iter()
+            .map(|entry| entry.path.as_str())
+            .collect::<HashSet<_>>();
+
+        let mut already_recorded = HashSet::new();
+        for signal in self
+            .history
+            .list_implicit_signals(thread_id, 50)
+            .await
+            .unwrap_or_default()
+        {
+            if signal.signal_type != "rapid_revert" {
+                continue;
+            }
+            let Some(snapshot) = signal.context_snapshot_json.as_deref() else {
+                continue;
+            };
+            let Ok(snapshot) = serde_json::from_str::<serde_json::Value>(snapshot) else {
+                continue;
+            };
+            if let Some(path) = snapshot.get("path").and_then(|value| value.as_str()) {
+                already_recorded.insert(path.to_string());
+            }
+        }
+
+        for entry in context.entries.iter().filter(|entry| {
+            entry.kind == WorkContextEntryKind::RepoChange
+                && entry.repo_root.as_deref() == Some(repo_root)
+                && entry.source != "repo_scan"
+        }) {
+            if detected_at.saturating_sub(entry.updated_at) > RAPID_REVERT_WINDOW_MS {
+                continue;
+            }
+            if changed_paths.contains(entry.path.as_str()) {
+                continue;
+            }
+            if !already_recorded.insert(entry.path.clone()) {
+                continue;
+            }
+            if let Err(error) = self
+                .record_rapid_revert_feedback(
+                    thread_id,
+                    &entry.path,
+                    &entry.source,
+                    entry.repo_root.as_deref(),
+                    entry.updated_at,
+                    detected_at,
+                )
+                .await
+            {
+                tracing::warn!(
+                    thread_id = %thread_id,
+                    path = %entry.path,
+                    error = %error,
+                    "failed to record rapid revert implicit feedback"
+                );
+            }
+        }
     }
 
     async fn merge_repo_scan_entries(

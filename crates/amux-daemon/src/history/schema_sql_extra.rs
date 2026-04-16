@@ -349,6 +349,30 @@ pub(super) fn extended_schema_sql() -> &'static str {
             );
             CREATE INDEX IF NOT EXISTS idx_satisfaction_scores_session_ts ON satisfaction_scores(session_id, computed_at_ms DESC);
 
+            CREATE TABLE IF NOT EXISTS intent_predictions (
+                id                 TEXT PRIMARY KEY,
+                session_id         TEXT NOT NULL,
+                context_state_hash TEXT NOT NULL,
+                predicted_action   TEXT NOT NULL,
+                confidence         REAL NOT NULL,
+                actual_action      TEXT,
+                was_correct        INTEGER,
+                created_at_ms      INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_intent_predictions_session_ts ON intent_predictions(session_id, created_at_ms DESC);
+
+            CREATE TABLE IF NOT EXISTS system_outcome_predictions (
+                id                TEXT PRIMARY KEY,
+                session_id        TEXT NOT NULL,
+                prediction_type   TEXT NOT NULL,
+                predicted_outcome TEXT NOT NULL,
+                confidence        REAL NOT NULL,
+                actual_outcome    TEXT,
+                was_correct       INTEGER,
+                created_at_ms     INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_system_outcome_predictions_session_ts ON system_outcome_predictions(session_id, created_at_ms DESC);
+
             CREATE TABLE IF NOT EXISTS thread_protocol_candidates (
                 thread_id   TEXT PRIMARY KEY,
                 state_json  TEXT NOT NULL,
@@ -496,6 +520,24 @@ pub(super) fn extended_schema_sql() -> &'static str {
                 completed_at_ms INTEGER NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_forge_pass_log_agent ON forge_pass_log(agent_id, completed_at_ms DESC);
+
+            CREATE TABLE IF NOT EXISTS event_triggers (
+                id                 TEXT PRIMARY KEY,
+                event_family       TEXT NOT NULL,
+                event_kind         TEXT NOT NULL,
+                target_state       TEXT,
+                thread_id          TEXT,
+                enabled            INTEGER NOT NULL DEFAULT 1,
+                cooldown_secs      INTEGER NOT NULL DEFAULT 0,
+                risk_label         TEXT NOT NULL DEFAULT 'low',
+                notification_kind  TEXT NOT NULL,
+                title_template     TEXT NOT NULL,
+                body_template      TEXT NOT NULL,
+                created_at         INTEGER NOT NULL,
+                updated_at         INTEGER NOT NULL,
+                last_fired_at      INTEGER
+            );
+            CREATE INDEX IF NOT EXISTS idx_event_triggers_family_kind_enabled ON event_triggers(event_family, event_kind, enabled, updated_at DESC);
 
             CREATE TABLE IF NOT EXISTS operator_profile_checkins (
                 id            TEXT PRIMARY KEY,

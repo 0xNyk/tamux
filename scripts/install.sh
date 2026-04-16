@@ -137,6 +137,21 @@ lookup_checksum() {
   ' "$CHECKSUM_PATH"
 }
 
+verify_archive() {
+  expected_hash="$(lookup_checksum "$archive_name")"
+
+  if [ -z "$expected_hash" ]; then
+    return 1
+  fi
+
+  actual_hash="$(sha256_file "$ARCHIVE_PATH")"
+  if [ "$actual_hash" != "$expected_hash" ]; then
+    die "SHA256 mismatch for ${archive_name}"
+  fi
+
+  return 0
+}
+
 extract_archive() {
   mkdir -p "$EXTRACT_DIR"
 
@@ -168,6 +183,7 @@ verify_binary() {
 }
 
 install_binaries() {
+  verify_extracted_binaries="$1"
   mkdir -p "$INSTALL_DIR"
 
   for binary_name in $BINARIES; do
@@ -175,7 +191,9 @@ install_binaries() {
       die "Release bundle is missing required binary ${binary_name}"
     fi
 
-    verify_binary "$binary_name"
+    if [ "$verify_extracted_binaries" = true ]; then
+      verify_binary "$binary_name"
+    fi
     cp "$EXTRACT_DIR/$binary_name" "$INSTALL_DIR/$binary_name"
     chmod 755 "$INSTALL_DIR/$binary_name"
   done
@@ -249,11 +267,16 @@ echo "Downloading tamux v${VERSION} for ${archive_platform}..."
 download_file "$CHECKSUM_URL" "$CHECKSUM_PATH"
 download_file "$ARCHIVE_URL" "$ARCHIVE_PATH"
 
+verify_extracted_binaries=true
+if verify_archive; then
+  verify_extracted_binaries=false
+fi
+
 echo "Extracting binaries and skills..."
 extract_archive
 
 echo "Verifying extracted binaries..."
-install_binaries
+install_binaries "$verify_extracted_binaries"
 install_skills
 
 echo ""

@@ -1,4 +1,6 @@
 use super::*;
+use crate::agent::learning::traces::hash_context_blob;
+use crate::agent::tool_executor::execute_tool;
 
 impl AgentEngine {
     async fn persist_implicit_feedback_signal(
@@ -30,7 +32,9 @@ impl AgentEngine {
         let signal_count = model.implicit_feedback.tool_hesitation_count
             + model.implicit_feedback.revision_message_count
             + model.implicit_feedback.correction_message_count
-            + model.implicit_feedback.fast_denial_count;
+            + model.implicit_feedback.fast_denial_count
+            + model.implicit_feedback.rapid_revert_count
+            + model.implicit_feedback.session_abandon_count;
         self.history
             .insert_satisfaction_score(&crate::history::SatisfactionScoreRow {
                 id: format!("satisfaction_{}", uuid::Uuid::new_v4()),
@@ -41,6 +45,231 @@ impl AgentEngine {
                 signal_count,
             })
             .await
+    }
+
+    pub(crate) async fn persist_intent_prediction_if_present(&self, item: &AnticipatoryItem) {
+        let Some(payload) = item.intent_prediction.as_ref() else {
+            return;
+        };
+        let session_id = item
+            .thread_id
+            .clone()
+            .unwrap_or_else(|| "global".to_string());
+        let context_state_hash = hash_context_blob(&format!(
+            "{}|{}|{}|{}",
+            session_id,
+            item.kind,
+            payload.primary_action,
+            item.preferred_attention_surface
+                .as_deref()
+                .unwrap_or_default()
+        ));
+        let _ = self
+            .history
+            .insert_intent_prediction(&crate::history::IntentPredictionRow {
+                id: format!("intent_prediction_{}", uuid::Uuid::new_v4()),
+                session_id,
+                context_state_hash,
+                predicted_action: payload.primary_action.clone(),
+                confidence: payload.confidence,
+                actual_action: None,
+                was_correct: None,
+                created_at_ms: item.created_at,
+            })
+            .await;
+    }
+
+    pub(crate) async fn persist_system_outcome_prediction_if_present(
+        &self,
+        item: &AnticipatoryItem,
+    ) {
+        if item.kind != "system_outcome_foresight" {
+            return;
+        }
+        let session_id = item
+            .thread_id
+            .clone()
+            .unwrap_or_else(|| "global".to_string());
+        let prediction_type = item
+            .bullets
+            .iter()
+            .find_map(|bullet| bullet.strip_prefix("prediction_type="))
+            .unwrap_or("unknown")
+            .to_string();
+        let predicted_outcome = if prediction_type == "stale_context" {
+            "stale context".to_string()
+        } else {
+            "build/test failure".to_string()
+        };
+        let _ = self
+            .history
+            .insert_system_outcome_prediction(&crate::history::SystemOutcomePredictionRow {
+                id: format!("system_outcome_prediction_{}", uuid::Uuid::new_v4()),
+                session_id,
+                prediction_type,
+                predicted_outcome,
+                confidence: item.confidence,
+                actual_outcome: None,
+                was_correct: None,
+                created_at_ms: item.created_at,
+            })
+            .await;
+    }
+
+    pub(crate) async fn resolve_system_outcome_prediction_feedback(
+        &self,
+        thread_id: &str,
+        observed_outcome: &str,
+    ) {
+        let matched = match observed_outcome.trim() {
+            "build/test failure" | "stale context" => Some(observed_outcome),
+            _ => None,
+        };
+        let _ = self
+            .history
+            .resolve_latest_system_outcome_prediction(thread_id, observed_outcome, matched)
+            .await;
+    }
+
+    fn classify_observed_operator_action(content: &str) -> &'static str {
+        let lowered = content.trim().to_ascii_lowercase();
+        if lowered.contains("approval") {
+            "review pending approval"
+        } else if lowered.contains("test")
+            || lowered.contains("build")
+            || lowered.contains("repo")
+            || lowered.contains("diff")
+        {
+            "inspect or test recent repo changes"
+        } else {
+            "continue the active thread"
+        }
+    }
+
+    pub(crate) async fn record_rapid_revert_feedback(
+        &self,
+        thread_id: &str,
+        path: &str,
+        source_tool: &str,
+        repo_root: Option<&str>,
+        agent_edit_recorded_at: u64,
+        detected_at: u64,
+    ) -> Result<()> {
+        let settings = self.config.read().await.operator_model.clone();
+        if !settings.enabled || !settings.allow_implicit_feedback {
+            return Ok(());
+        }
+
+        ensure_operator_model_file(&self.data_dir).await?;
+        let age_ms = detected_at.saturating_sub(agent_edit_recorded_at);
+        let model_snapshot = {
+            let mut model = self.operator_model.write().await;
+            model.last_updated = detected_at;
+            model.implicit_feedback.rapid_revert_count += 1;
+            refresh_operator_satisfaction(&mut model);
+            persist_operator_model(&self.data_dir, &model)?;
+            model.clone()
+        };
+
+        self.record_behavioral_event(
+            "rapid_revert",
+            BehavioralEventContext {
+                thread_id: Some(thread_id),
+                task_id: None,
+                goal_run_id: None,
+                approval_id: None,
+            },
+            serde_json::json!({
+                "thread_id": thread_id,
+                "path": path,
+                "source_tool": source_tool,
+                "repo_root": repo_root,
+                "agent_edit_recorded_at": agent_edit_recorded_at,
+                "detected_at": detected_at,
+                "age_ms": age_ms,
+            }),
+        )
+        .await?;
+
+        self.persist_implicit_feedback_signal(
+            thread_id,
+            "rapid_revert",
+            -0.20,
+            detected_at,
+            serde_json::json!({
+                "thread_id": thread_id,
+                "path": path,
+                "source_tool": source_tool,
+                "repo_root": repo_root,
+                "agent_edit_recorded_at": agent_edit_recorded_at,
+                "detected_at": detected_at,
+                "age_ms": age_ms,
+            }),
+        )
+        .await?;
+        self.persist_operator_satisfaction_snapshot(thread_id, detected_at, &model_snapshot)
+            .await?;
+        Ok(())
+    }
+
+    pub(crate) async fn record_session_abandon_feedback(
+        &self,
+        thread_id: &str,
+        last_assistant_message: &str,
+        assistant_timestamp: u64,
+        detected_at: u64,
+    ) -> Result<()> {
+        let settings = self.config.read().await.operator_model.clone();
+        if !settings.enabled || !settings.allow_implicit_feedback {
+            return Ok(());
+        }
+
+        ensure_operator_model_file(&self.data_dir).await?;
+        let age_ms = detected_at.saturating_sub(assistant_timestamp);
+        let model_snapshot = {
+            let mut model = self.operator_model.write().await;
+            model.last_updated = detected_at;
+            model.implicit_feedback.session_abandon_count += 1;
+            refresh_operator_satisfaction(&mut model);
+            persist_operator_model(&self.data_dir, &model)?;
+            model.clone()
+        };
+
+        self.record_behavioral_event(
+            "session_abandon",
+            BehavioralEventContext {
+                thread_id: Some(thread_id),
+                task_id: None,
+                goal_run_id: None,
+                approval_id: None,
+            },
+            serde_json::json!({
+                "thread_id": thread_id,
+                "last_assistant_message": last_assistant_message,
+                "assistant_timestamp": assistant_timestamp,
+                "detected_at": detected_at,
+                "age_ms": age_ms,
+            }),
+        )
+        .await?;
+
+        self.persist_implicit_feedback_signal(
+            thread_id,
+            "session_abandon",
+            -0.14,
+            detected_at,
+            serde_json::json!({
+                "thread_id": thread_id,
+                "last_assistant_message": last_assistant_message,
+                "assistant_timestamp": assistant_timestamp,
+                "detected_at": detected_at,
+                "age_ms": age_ms,
+            }),
+        )
+        .await?;
+        self.persist_operator_satisfaction_snapshot(thread_id, detected_at, &model_snapshot)
+            .await?;
+        Ok(())
     }
 
     pub(crate) async fn learned_approval_decision(
@@ -108,6 +337,53 @@ impl AgentEngine {
         pending
             .values()
             .any(|existing| existing.category == category)
+    }
+
+    pub async fn resume_critique_approval_continuation(
+        &self,
+        approval_id: &str,
+        decision: ApprovalDecision,
+        session_manager: &Arc<SessionManager>,
+        event_tx: &broadcast::Sender<AgentEvent>,
+        agent_data_dir: &std::path::Path,
+        http_client: &reqwest::Client,
+    ) -> Result<ToolResult> {
+        self.record_operator_approval_resolution(approval_id, decision)
+            .await?;
+
+        if matches!(decision, ApprovalDecision::Deny) {
+            return Ok(ToolResult {
+                tool_call_id: approval_id.to_string(),
+                name: "critique_confirmation".to_string(),
+                content: "Critique confirmation denied by operator.".to_string(),
+                is_error: true,
+                weles_review: None,
+                pending_approval: None,
+            });
+        }
+
+        let continuation = self
+            .critique_approval_continuations
+            .lock()
+            .await
+            .remove(approval_id)
+            .ok_or_else(|| {
+                anyhow::anyhow!("unknown critique approval continuation: {approval_id}")
+            })?;
+
+        Ok(execute_tool(
+            &continuation.tool_call,
+            self,
+            &continuation.thread_id,
+            None,
+            session_manager,
+            None,
+            event_tx,
+            agent_data_dir,
+            http_client,
+            None,
+        )
+        .await)
     }
 
     pub(crate) async fn build_operator_model_prompt_summary(&self) -> Option<String> {
@@ -191,7 +467,9 @@ impl AgentEngine {
         if settings.allow_implicit_feedback
             && (model.implicit_feedback.tool_hesitation_count > 0
                 || model.implicit_feedback.revision_message_count > 0
-                || model.implicit_feedback.fast_denial_count > 0)
+                || model.implicit_feedback.fast_denial_count > 0
+                || model.implicit_feedback.rapid_revert_count > 0
+                || model.implicit_feedback.session_abandon_count > 0)
         {
             let fallback = model
                 .implicit_feedback
@@ -199,22 +477,46 @@ impl AgentEngine {
                 .first()
                 .cloned()
                 .unwrap_or_else(|| "none yet".to_string());
-            lines.push(format!(
-                "- Implicit feedback: {} tool fallback(s), {} revision-style operator message(s), {} fast denial(s); common fallback {}",
-                model.implicit_feedback.tool_hesitation_count,
-                model.implicit_feedback.revision_message_count,
-                model.implicit_feedback.fast_denial_count,
-                fallback,
-            ));
+            if model.implicit_feedback.rapid_revert_count > 0
+                || model.implicit_feedback.session_abandon_count > 0
+            {
+                lines.push(format!(
+                    "- Implicit feedback: {} tool fallback(s), {} revision-style operator message(s), {} fast denial(s), {} rapid revert(s), {} session abandon(s); common fallback {}",
+                    model.implicit_feedback.tool_hesitation_count,
+                    model.implicit_feedback.revision_message_count,
+                    model.implicit_feedback.fast_denial_count,
+                    model.implicit_feedback.rapid_revert_count,
+                    model.implicit_feedback.session_abandon_count,
+                    fallback,
+                ));
+            } else {
+                lines.push(format!(
+                    "- Implicit feedback: {} tool fallback(s), {} revision-style operator message(s), {} fast denial(s); common fallback {}",
+                    model.implicit_feedback.tool_hesitation_count,
+                    model.implicit_feedback.revision_message_count,
+                    model.implicit_feedback.fast_denial_count,
+                    fallback,
+                ));
+            }
         }
         lines.push(format!(
-            "- Satisfaction signal: {} ({:.2}); friction markers revisions {}, corrections {}, tool fallbacks {}, fast denials {}",
+            "- Satisfaction signal: {} ({:.2}); friction markers revisions {}, corrections {}, tool fallbacks {}, fast denials {}{}{}",
             model.operator_satisfaction.label,
             model.operator_satisfaction.score,
             model.implicit_feedback.revision_message_count,
             model.implicit_feedback.correction_message_count,
             model.implicit_feedback.tool_hesitation_count,
             model.implicit_feedback.fast_denial_count,
+            if model.implicit_feedback.rapid_revert_count > 0 {
+                format!(", rapid reverts {}", model.implicit_feedback.rapid_revert_count)
+            } else {
+                String::new()
+            },
+            if model.implicit_feedback.session_abandon_count > 0 {
+                format!(", session abandons {}", model.implicit_feedback.session_abandon_count)
+            } else {
+                String::new()
+            },
         ));
         lines.extend(operator_adaptation_lines(&model));
         if lines.is_empty() {
@@ -391,6 +693,12 @@ impl AgentEngine {
                 .await?;
         }
 
+        let observed_action = Self::classify_observed_operator_action(content);
+        let _ = self
+            .history
+            .resolve_latest_intent_prediction(thread_id, observed_action, Some(observed_action))
+            .await;
+
         if let Err(error) = self.analyze_emergent_protocol_for_thread(thread_id).await {
             tracing::debug!(thread_id = %thread_id, error = %error, "emergent protocol analysis failed after operator message");
         }
@@ -531,6 +839,14 @@ impl AgentEngine {
 
         ensure_operator_model_file(&self.data_dir).await?;
         let now = now_millis();
+        let previous_attention = {
+            let model = self.operator_model.read().await;
+            model
+                .attention_topology
+                .last_surface
+                .clone()
+                .zip(model.attention_topology.last_surface_at)
+        };
         let model_snapshot = {
             let mut model = self.operator_model.write().await;
             model.last_updated = now;
@@ -553,20 +869,25 @@ impl AgentEngine {
         )
         .await?;
 
-        if model_snapshot.attention_topology.rapid_switch_count > 0 {
-            self.persist_implicit_feedback_signal(
-                "global",
-                "short_dwell",
-                -0.03,
-                now,
-                serde_json::json!({
-                    "surface": normalized,
-                    "rapid_switch_count": model_snapshot.attention_topology.rapid_switch_count,
-                }),
-            )
-            .await?;
-            self.persist_operator_satisfaction_snapshot("global", now, &model_snapshot)
+        if let Some((previous_surface, previous_at)) = previous_attention {
+            let dwell_secs = now.saturating_sub(previous_at) / 1000;
+            if previous_surface != normalized && dwell_secs > 0 && dwell_secs <= 15 {
+                self.persist_implicit_feedback_signal(
+                    "global",
+                    "short_dwell",
+                    -0.03,
+                    now,
+                    serde_json::json!({
+                        "surface": previous_surface,
+                        "next_surface": normalized,
+                        "dwell_secs": dwell_secs,
+                        "rapid_switch_count": model_snapshot.attention_topology.rapid_switch_count,
+                    }),
+                )
                 .await?;
+                self.persist_operator_satisfaction_snapshot("global", now, &model_snapshot)
+                    .await?;
+            }
         }
         Ok(())
     }
@@ -802,6 +1123,8 @@ impl AgentEngine {
                 "revision_message_count": operator_model.implicit_feedback.revision_message_count,
                 "correction_message_count": operator_model.implicit_feedback.correction_message_count,
                 "fast_denial_count": operator_model.implicit_feedback.fast_denial_count,
+                "rapid_revert_count": operator_model.implicit_feedback.rapid_revert_count,
+                "session_abandon_count": operator_model.implicit_feedback.session_abandon_count,
                 "rapid_switch_count": operator_model.attention_topology.rapid_switch_count,
                 "recent_implicit_signals": recent_implicit_signals,
                 "recent_satisfaction_scores": recent_satisfaction_scores,
@@ -846,6 +1169,7 @@ fn fallback_skill_gate_family(recommended_skill: Option<&str>) -> Vec<String> {
 
 fn operator_adaptation_lines(model: &OperatorModel) -> Vec<String> {
     let mut lines = Vec::new();
+    let adaptation = BehaviorAdaptationProfile::from_model(model);
 
     let response_mode = match model.operator_satisfaction.label.as_str() {
         "strained" => {
@@ -870,12 +1194,22 @@ fn operator_adaptation_lines(model: &OperatorModel) -> Vec<String> {
         || model.cognitive_style.skips_reasoning
     {
         "- Adaptive delivery rule: default to summary-first and keep reasoning on demand unless the operator explicitly asks for detail.".to_string()
-    } else if matches!(model.cognitive_style.reading_depth, ReadingDepth::Deep) {
+    } else if matches!(model.cognitive_style.reading_depth, ReadingDepth::Deep)
+        && !adaptation.compact_response
+    {
         "- Adaptive delivery rule: include fuller reasoning and step-by-step traces when they materially improve confidence or debugging speed.".to_string()
+    } else if adaptation.compact_response {
+        "- Adaptive delivery rule: keep the answer compact, front-load the conclusion, and add only the detail needed for the next action.".to_string()
     } else {
         "- Adaptive delivery rule: start with the conclusion, then add only the detail needed to support the next action.".to_string()
     };
     lines.push(delivery_mode);
+
+    if adaptation.prompt_for_clarification {
+        lines.push(
+            "- Adaptive clarification rule: when intent is underspecified, ask one targeted question before guessing broadly.".to_string(),
+        );
+    }
 
     if model.risk_fingerprint.approval_requests > 0 {
         let avg_response_time_secs = model.risk_fingerprint.avg_response_time_secs;

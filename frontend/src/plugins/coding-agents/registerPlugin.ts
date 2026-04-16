@@ -83,7 +83,7 @@ export function registerCodingAgentsPlugin() {
     pluginApi.registerPlugin({
         id: "coding-agents",
         name: "Coding Agents",
-        version: "0.5.2",
+        version: "0.5.3",
         assistantTools: [
             {
                 type: "function",

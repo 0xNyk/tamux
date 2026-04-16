@@ -528,6 +528,7 @@ fn operator_model_diagnostic_summary_exposes_thresholds_and_friction() {
     assert!(summary.contains("corrections 1"));
     assert!(summary.contains("tool fallbacks 2"));
     assert!(summary.contains("rapid switches 3"));
+    assert!(summary.contains("rapid reverts 0"));
 }
 
 #[tokio::test]
@@ -693,7 +694,37 @@ async fn strained_operator_satisfaction_adds_recovery_guidance() {
         .expect("operator model prompt summary");
     assert!(summary.contains("Satisfaction signal: strained (0.18); friction markers revisions 1, corrections 1, tool fallbacks 1, fast denials 1"));
     assert!(summary.contains("Adaptive response mode: reduce friction aggressively"));
+    assert!(summary.contains("Adaptive delivery rule: keep the answer compact"));
+    assert!(summary.contains("Adaptive clarification rule: when intent is underspecified, ask one targeted question before guessing broadly"));
     assert!(summary.contains("prefer the later successful fallback earlier"));
+}
+
+#[tokio::test]
+async fn fragile_operator_satisfaction_adds_compact_delivery_and_clarification_guidance() {
+    let root = tempdir().expect("tempdir");
+    let manager = SessionManager::new_test(root.path()).await;
+    let mut config = AgentConfig::default();
+    config.operator_model.enabled = true;
+    config.operator_model.allow_message_statistics = true;
+    config.operator_model.allow_implicit_feedback = true;
+    let engine = AgentEngine::new_test(manager, config, root.path()).await;
+
+    {
+        let mut model = engine.operator_model.write().await;
+        model.cognitive_style.message_count = 1;
+        model.operator_satisfaction.label = "fragile".to_string();
+        model.operator_satisfaction.score = 0.54;
+        model.implicit_feedback.correction_message_count = 1;
+    }
+
+    let summary = engine
+        .build_operator_model_prompt_summary()
+        .await
+        .expect("operator model prompt summary");
+    assert!(summary.contains("Satisfaction signal: fragile (0.54); friction markers revisions 0, corrections 1, tool fallbacks 0, fast denials 0"));
+    assert!(summary.contains("Adaptive response mode: tighten the loop"));
+    assert!(summary.contains("Adaptive delivery rule: keep the answer compact"));
+    assert!(summary.contains("Adaptive clarification rule: when intent is underspecified, ask one targeted question before guessing broadly"));
 }
 
 #[tokio::test]
@@ -821,6 +852,203 @@ async fn operator_correction_persists_thread_scoped_signal_and_score_snapshot() 
     assert_eq!(scores[0].label, "fragile");
     assert_eq!(scores[0].signal_count, 2);
     assert!((scores[0].score - 0.54).abs() < 1e-9);
+}
+
+#[tokio::test]
+async fn rapid_revert_persists_thread_scoped_signal_when_agent_file_edit_is_quickly_reverted() {
+    let root = tempdir().expect("tempdir");
+    let manager = SessionManager::new_test(root.path()).await;
+    let mut config = AgentConfig::default();
+    config.operator_model.enabled = true;
+    config.operator_model.allow_implicit_feedback = true;
+    let engine = AgentEngine::new_test(manager, config, root.path()).await;
+    engine.set_aline_startup_test_availability(false);
+
+    let git_dir = root.path();
+    let git_init = std::process::Command::new("git")
+        .args(["init"])
+        .current_dir(git_dir)
+        .output()
+        .expect("git init should spawn");
+    assert!(git_init.status.success(), "git init should succeed");
+
+    let git_user_name = std::process::Command::new("git")
+        .args(["config", "user.name", "tamux tests"])
+        .current_dir(git_dir)
+        .output()
+        .expect("git config user.name should spawn");
+    assert!(
+        git_user_name.status.success(),
+        "git config user.name should succeed"
+    );
+
+    let git_user_email = std::process::Command::new("git")
+        .args(["config", "user.email", "tamux@example.com"])
+        .current_dir(git_dir)
+        .output()
+        .expect("git config user.email should spawn");
+    assert!(
+        git_user_email.status.success(),
+        "git config user.email should succeed"
+    );
+
+    let src_dir = root.path().join("src");
+    std::fs::create_dir_all(&src_dir).expect("create src dir");
+    let file_path = src_dir.join("lib.rs");
+    let baseline = "pub fn answer() -> u32 {\n    41\n}\n";
+    std::fs::write(&file_path, baseline).expect("write baseline file");
+
+    let git_add = std::process::Command::new("git")
+        .args(["add", "src/lib.rs"])
+        .current_dir(git_dir)
+        .output()
+        .expect("git add should spawn");
+    assert!(git_add.status.success(), "git add should succeed");
+
+    let git_commit = std::process::Command::new("git")
+        .args(["commit", "-m", "initial"])
+        .current_dir(git_dir)
+        .output()
+        .expect("git commit should spawn");
+    assert!(git_commit.status.success(), "git commit should succeed");
+
+    let agent_version = "pub fn answer() -> u32 {\n    42\n}\n";
+    std::fs::write(&file_path, agent_version).expect("write agent version");
+    engine
+        .record_file_work_context(
+            "thread-rapid-revert",
+            None,
+            "write_file",
+            file_path.to_str().expect("utf-8 file path"),
+        )
+        .await;
+
+    std::fs::write(&file_path, baseline).expect("revert file back to baseline");
+    engine
+        .refresh_thread_repo_context("thread-rapid-revert")
+        .await;
+
+    let signals = engine
+        .history
+        .list_implicit_signals("thread-rapid-revert", 10)
+        .await
+        .expect("load rapid revert signals");
+    assert_eq!(
+        signals.len(),
+        1,
+        "rapid revert should persist exactly one implicit feedback signal"
+    );
+    assert_eq!(signals[0].signal_type, "rapid_revert");
+    assert!(
+        signals[0].weight < -0.16,
+        "rapid revert should be a stronger negative signal than an operator correction"
+    );
+    assert!(signals[0]
+        .context_snapshot_json
+        .as_deref()
+        .is_some_and(|json| json.contains("src/lib.rs") && json.contains("write_file")));
+}
+
+#[tokio::test]
+async fn very_short_attention_dwell_persists_short_dwell_signal_with_duration() {
+    let root = tempdir().expect("tempdir");
+    let manager = SessionManager::new_test(root.path()).await;
+    let mut config = AgentConfig::default();
+    config.operator_model.enabled = true;
+    config.operator_model.allow_implicit_feedback = true;
+    config.operator_model.allow_attention_tracking = true;
+    let engine = AgentEngine::new_test(manager, config, root.path()).await;
+
+    engine
+        .record_attention_surface("conversation:chat")
+        .await
+        .expect("record first attention surface");
+    tokio::time::sleep(std::time::Duration::from_millis(1_200)).await;
+    engine
+        .record_attention_surface("modal:command_palette")
+        .await
+        .expect("record second attention surface");
+
+    let signals = engine
+        .history
+        .list_implicit_signals("global", 10)
+        .await
+        .expect("load implicit signals");
+    let short_dwell = signals
+        .iter()
+        .find(|signal| signal.signal_type == "short_dwell")
+        .expect("short dwell signal should be persisted");
+    assert!(short_dwell.weight < 0.0);
+    assert!(short_dwell
+        .context_snapshot_json
+        .as_deref()
+        .is_some_and(|json| json.contains("dwell_secs") && json.contains("conversation:chat")));
+}
+
+#[tokio::test]
+async fn deleting_thread_right_after_assistant_reply_persists_session_abandon_signal() {
+    let root = tempdir().expect("tempdir");
+    let manager = SessionManager::new_test(root.path()).await;
+    let mut config = AgentConfig::default();
+    config.operator_model.enabled = true;
+    config.operator_model.allow_implicit_feedback = true;
+    let engine = AgentEngine::new_test(manager, config, root.path()).await;
+
+    let now = now_millis();
+    let mut assistant = AgentMessage::user("Here is the answer.", now);
+    assistant.role = MessageRole::Assistant;
+
+    engine.threads.write().await.insert(
+        "thread-session-abandon".to_string(),
+        AgentThread {
+            id: "thread-session-abandon".to_string(),
+            agent_name: Some(crate::agent::agent_identity::MAIN_AGENT_NAME.to_string()),
+            title: "Abandonable thread".to_string(),
+            messages: vec![
+                AgentMessage::user("Help me.", now.saturating_sub(1_000)),
+                assistant,
+            ],
+            pinned: false,
+            upstream_thread_id: None,
+            upstream_transport: None,
+            upstream_provider: None,
+            upstream_model: None,
+            upstream_assistant_id: None,
+            created_at: now.saturating_sub(1_000),
+            updated_at: now,
+            total_input_tokens: 0,
+            total_output_tokens: 0,
+        },
+    );
+
+    assert!(engine.delete_thread("thread-session-abandon").await);
+
+    let signals = engine
+        .history
+        .list_implicit_signals("thread-session-abandon", 10)
+        .await
+        .expect("load session abandonment signals");
+    assert_eq!(signals.len(), 1);
+    assert_eq!(signals[0].signal_type, "session_abandon");
+    assert!(signals[0].weight < 0.0);
+    assert!(signals[0]
+        .context_snapshot_json
+        .as_deref()
+        .is_some_and(
+            |json| json.contains("thread-session-abandon") && json.contains("Here is the answer.")
+        ));
+
+    let scores = engine
+        .history
+        .list_satisfaction_scores("thread-session-abandon", 10)
+        .await
+        .expect("load abandonment satisfaction scores");
+    assert_eq!(scores.len(), 1);
+    assert!(matches!(
+        scores[0].label.as_str(),
+        "fragile" | "strained" | "healthy"
+    ));
+    assert_eq!(scores[0].signal_count, 1);
 }
 
 #[test]

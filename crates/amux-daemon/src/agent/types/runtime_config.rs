@@ -578,6 +578,22 @@ pub struct ThreadWorkContext {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct IntentPredictionCandidate {
+    pub rank: u8,
+    pub action: String,
+    pub confidence: f64,
+    pub rationale: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct IntentPredictionPayload {
+    pub primary_action: String,
+    pub confidence: f64,
+    #[serde(default)]
+    pub ranked_actions: Vec<IntentPredictionCandidate>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct AnticipatoryItem {
     pub id: String,
     pub kind: String,
@@ -585,6 +601,8 @@ pub struct AnticipatoryItem {
     pub summary: String,
     #[serde(default)]
     pub bullets: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub intent_prediction: Option<IntentPredictionPayload>,
     pub confidence: f64,
     #[serde(default)]
     pub goal_run_id: Option<String>,

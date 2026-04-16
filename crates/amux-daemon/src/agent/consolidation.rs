@@ -167,6 +167,7 @@ impl AgentEngine {
                 "forge_patterns_detected": result.forge_patterns_detected,
                 "forge_hints_generated": result.forge_hints_generated,
                 "forge_hints_auto_applied": result.forge_hints_auto_applied,
+                "forge_hints_logged_only": result.forge_hints_logged_only,
                 "facts_decayed": result.facts_decayed,
                 "tombstones_purged": result.tombstones_purged,
                 "facts_refined": result.facts_refined,
@@ -265,6 +266,7 @@ impl AgentEngine {
                 result.forge_patterns_detected = pass.patterns_detected;
                 result.forge_hints_generated = pass.hints_generated;
                 result.forge_hints_auto_applied = pass.hints_auto_applied;
+                result.forge_hints_logged_only = pass.hints_logged_only;
                 self.record_learning_subphase_run(FORGE_LAST_RUN_KEY_PREFIX, &agent_id)
                     .await;
             }

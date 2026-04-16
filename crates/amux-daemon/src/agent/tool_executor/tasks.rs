@@ -4,6 +4,20 @@ async fn execute_list_subagents(
     thread_id: &str,
     task_id: Option<&str>,
 ) -> Result<String> {
+    fn is_descendant_of(task: &AgentTask, ancestor_task_id: &str, all_tasks: &[AgentTask]) -> bool {
+        let mut current_parent_id = task.parent_task_id.as_deref();
+        while let Some(parent_id) = current_parent_id {
+            if parent_id == ancestor_task_id {
+                return true;
+            }
+            current_parent_id = all_tasks
+                .iter()
+                .find(|candidate| candidate.id == parent_id)
+                .and_then(|parent| parent.parent_task_id.as_deref());
+        }
+        false
+    }
+
     let status_filter = args
         .get("status")
         .and_then(|value| value.as_str())
@@ -36,14 +50,14 @@ async fn execute_list_subagents(
             if task.source != "subagent" {
                 return false;
             }
-            parent_task_id
+            if let Some(parent_task_id) = parent_task_id.as_deref() {
+                return is_descendant_of(task, parent_task_id, &all_tasks);
+            }
+
+            parent_thread_id
                 .as_deref()
-                .map(|value| task.parent_task_id.as_deref() == Some(value))
+                .map(|value| task.parent_thread_id.as_deref() == Some(value))
                 .unwrap_or(false)
-                || parent_thread_id
-                    .as_deref()
-                    .map(|value| task.parent_thread_id.as_deref() == Some(value))
-                    .unwrap_or(false)
         })
         .collect::<Vec<_>>();
 
@@ -64,7 +78,12 @@ async fn execute_list_subagents(
         let max_depth = parse_subagent_containment_scope(task.containment_scope.as_deref())
             .map(|(_, max_depth)| max_depth)
             .unwrap_or_else(|| effective_subagent_max_depth(&task, &all_tasks));
-        let metrics = agent.history.get_subagent_metrics(&task.id).await.ok().flatten();
+        let metrics = agent
+            .history
+            .get_subagent_metrics(&task.id)
+            .await
+            .ok()
+            .flatten();
         let tool_call_limit = extract_tool_call_limit(task.termination_conditions.as_deref());
 
         let tokens_remaining_fraction = match (task.context_budget_tokens, metrics.as_ref()) {
@@ -374,7 +393,9 @@ async fn execute_dispatch_via_bid_protocol(
                 Some("available") => crate::agent::collaboration::BidAvailability::Available,
                 Some("busy") => crate::agent::collaboration::BidAvailability::Busy,
                 Some("unavailable") => crate::agent::collaboration::BidAvailability::Unavailable,
-                _ => anyhow::bail!("each bid requires availability in [available, busy, unavailable]"),
+                _ => anyhow::bail!(
+                    "each bid requires availability in [available, busy, unavailable]"
+                ),
             };
             Ok(crate::agent::collaboration::DispatchBidRequest {
                 task_id,
@@ -384,7 +405,9 @@ async fn execute_dispatch_via_bid_protocol(
         })
         .collect::<Result<Vec<_>>>()?;
 
-    let report = agent.dispatch_via_bid_protocol(parent_task_id, &bids).await?;
+    let report = agent
+        .dispatch_via_bid_protocol(parent_task_id, &bids)
+        .await?;
     Ok(serde_json::to_string_pretty(&report).unwrap_or_else(|_| "{}".to_string()))
 }
 

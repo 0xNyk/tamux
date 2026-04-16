@@ -10,7 +10,15 @@ import { appendDaemonSystemMessage, normalizeBridgePayload } from "./daemonHelpe
 import { parseLeadingAgentDirective, type AgentDirective } from "./agentDirective";
 import type { BuiltinAgentSetupState } from "./types";
 
-const BUILTIN_PERSONA_ALIASES = ["swarozyc", "radogost", "domowoj", "swietowit"] as const;
+const BUILTIN_PERSONA_ALIASES = [
+  "swarozyc",
+  "radogost",
+  "domowoj",
+  "swietowit",
+  "perun",
+  "mokosh",
+  "dazhbog",
+] as const;
 
 type PendingBuiltinAgentSetup = BuiltinAgentSetupState & {
   directive: AgentDirective;
@@ -274,11 +282,15 @@ export function useDaemonAgentActions({
         "svarog",
         "swarog",
         "weles",
+        "veles",
         "rarog",
         "swarozyc",
         "radogost",
         "domowoj",
         "swietowit",
+        "perun",
+        "mokosh",
+        "dazhbog",
         ...useAgentStore.getState().subAgents.flatMap((agent) => [agent.id, agent.name]),
       ].filter(Boolean);
       const directive = parseLeadingAgentDirective(text, knownAgentAliases);

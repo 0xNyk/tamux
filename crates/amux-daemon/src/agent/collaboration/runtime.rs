@@ -378,6 +378,85 @@ impl AgentEngine {
         Ok(snapshot)
     }
 
+    async fn bootstrap_bid_dispatch_collaboration(
+        &self,
+        parent_task_id: &str,
+        bid_task_ids: &[String],
+    ) -> Result<()> {
+        let (parent, eligible_subagents) = {
+            let tasks = self.tasks.lock().await;
+            let parent = tasks
+                .iter()
+                .find(|task| task.id == parent_task_id)
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("unknown parent task {parent_task_id}"))?;
+            let eligible_subagents = bid_task_ids
+                .iter()
+                .filter_map(|task_id| {
+                    tasks.iter().find(|task| {
+                        task.id == *task_id
+                            && task.source == "subagent"
+                            && task.parent_task_id.as_deref() == Some(parent_task_id)
+                    })
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            (parent, eligible_subagents)
+        };
+
+        let mut collaboration = self.collaboration.write().await;
+        let session = collaboration
+            .entry(parent_task_id.to_string())
+            .or_insert_with(|| CollaborationSession {
+                id: format!("collab_{}", uuid::Uuid::new_v4()),
+                parent_task_id: parent_task_id.to_string(),
+                thread_id: parent.thread_id.clone().or(parent.parent_thread_id.clone()),
+                goal_run_id: parent.goal_run_id.clone(),
+                mission: parent.description.clone(),
+                agents: Vec::new(),
+                call_metadata: None,
+                bids: Vec::new(),
+                role_assignment: None,
+                contributions: Vec::new(),
+                disagreements: Vec::new(),
+                consensus: None,
+                updated_at: now_millis(),
+            });
+
+        session.thread_id = session
+            .thread_id
+            .clone()
+            .or(parent.thread_id.clone())
+            .or(parent.parent_thread_id.clone());
+        session.goal_run_id = session.goal_run_id.clone().or(parent.goal_run_id.clone());
+        if session.mission.trim().is_empty() {
+            session.mission = parent.description.clone();
+        }
+
+        for subagent in eligible_subagents {
+            if session
+                .agents
+                .iter()
+                .any(|agent| agent.task_id == subagent.id)
+            {
+                continue;
+            }
+            session.agents.push(CollaborativeAgent {
+                task_id: subagent.id.clone(),
+                title: subagent.title.clone(),
+                role: infer_collaboration_role(&subagent),
+                confidence: 0.5,
+                status: format!("{:?}", subagent.status).to_lowercase(),
+            });
+        }
+        session.updated_at = now_millis();
+        let snapshot = session.clone();
+        drop(collaboration);
+
+        self.persist_collaboration_session(&snapshot).await?;
+        Ok(())
+    }
+
     async fn persisted_collaboration_session(
         &self,
         parent_task_id: &str,
@@ -682,6 +761,8 @@ impl AgentEngine {
             .iter()
             .map(|bid| bid.task_id.clone())
             .collect::<Vec<_>>();
+        self.bootstrap_bid_dispatch_collaboration(parent_task_id, &eligible_agents)
+            .await?;
         self.call_for_bids(parent_task_id, &eligible_agents).await?;
         for bid in bids {
             self.submit_bid(
